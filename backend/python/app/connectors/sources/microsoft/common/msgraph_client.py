@@ -24,6 +24,8 @@ from msgraph.generated.users.users_request_builder import UsersRequestBuilder
 from app.models.entities import AppUser, FileRecord
 from app.models.permission import Permission, PermissionType
 
+class ResourceNotFoundError(Exception):
+    pass
 
 # Map Microsoft Graph roles to permission type
 def map_msgraph_role_to_permission_type(role: str) -> PermissionType:
@@ -289,7 +291,7 @@ class MSGraphClient:
             self.logger.warning(f"Could not fetch details for user {user_id}: {ex}")
             return None
 
-    async def get_user_info(self, user_id: str) -> Optional[Dict[str, Any]]:
+    async def get_user_info(self, user_id: str) -> Dict[str, Any]:
         """
         Fetches user information (email and display name) by user ID.
 
@@ -310,15 +312,19 @@ class MSGraphClient:
 
                 user = await self.client.users.by_user_id(user_id).get(request_configuration)
 
-                if user:
-                    return {
-                        'email': user.mail or user.user_principal_name,
-                        'display_name': user.display_name
-                    }
-            return None
+                if not user:
+                    raise ResourceNotFoundError(f"User {user_id} not found")
+
+                return {
+                    'email': user.mail or user.user_principal_name,
+                    'display_name': user.display_name
+                }
+
+        except ODataError as e:
+            raise e
         except Exception as ex:
             self.logger.warning(f"Could not fetch user info for {user_id}: {ex}")
-            return None
+            raise ex
 
     async def get_user_drive(self, user_id: str) -> Optional[Drive]:
         """
@@ -424,7 +430,9 @@ class MSGraphClient:
 
                 self.logger.info(f"Retrieved delta response with {len(response['drive_items'])} items")
                 return response
-
+        except ODataError as e:
+            self.logger.error(f"Error fetching delta response for URL {url}: {e}")
+            raise e
         except Exception as ex:
             self.logger.error(f"Error fetching delta response for URL {url}: {ex}")
             raise ex
@@ -512,10 +520,10 @@ class MSGraphClient:
             return permissions
         except ODataError as e:
             self.logger.error(f"Error fetching file permissions for File ID {item_id}: {e}")
-            return []
+            raise e
         except Exception as ex:
             self.logger.error(f"Unexpected error fetching file permissions for File ID {item_id}: {ex}")
-            return []
+            raise ex
 
     async def list_folder_children(self, drive_id: str, folder_id: str) -> List[DriveItem]:
         """
@@ -574,7 +582,7 @@ class MSGraphClient:
 
         except Exception as ex:
             self.logger.error(f"Error creating signed URL for item {item_id} in drive {drive_id}: {ex}")
-            return None
+            raise ex
 
     async def search_query(
         self,

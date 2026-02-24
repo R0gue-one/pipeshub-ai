@@ -64,6 +64,7 @@ from app.models.entities import (
 from app.models.permission import EntityType, Permission, PermissionType
 from app.utils.streaming import create_stream_record_response, stream_content
 from app.utils.time_conversion import get_epoch_timestamp_in_ms
+import logging
 
 
 @dataclass
@@ -177,6 +178,7 @@ class OneDriveConnector(BaseConnector):
         self.indexing_filters: FilterCollection = FilterCollection()
 
     async def init(self) -> bool:
+        logging.getLogger("azure").setLevel(logging.ERROR)
         config = await self.config_service.get_config(f"/services/connectors/{self.connector_id}/config")
         if not config:
             self.logger.error("OneDrive config not found")
@@ -241,6 +243,8 @@ class OneDriveConnector(BaseConnector):
             if not self._pass_extension_filter(item):
                 self.logger.debug(f"Skipping item {item.name} (ID: {item.id}) due to extention filters.")
                 return
+            self.logger.debug(f"\n\n\n\nItem: {item.name}")
+            self.logger.debug(f"Item: {item}")
 
             # Check if item is deleted
             if hasattr(item, 'deleted') and item.deleted is not None:
@@ -304,6 +308,7 @@ class OneDriveConnector(BaseConnector):
                 )
 
             is_shared = hasattr(item, 'shared') and item.shared is not None
+            self.logger.debug(f"\nIs shared: {is_shared}")
 
             file_record = FileRecord(
                 id=existing_record.id if existing_record else str(uuid.uuid4()),
@@ -346,6 +351,7 @@ class OneDriveConnector(BaseConnector):
                 item.parent_reference.drive_id if item.parent_reference else None,
                 item.id
             )
+            self.logger.debug(f"\nPermission result: {permission_result}")
 
             new_permissions = await self._convert_to_permissions(permission_result)
 
@@ -745,8 +751,6 @@ class OneDriveConnector(BaseConnector):
 
         except Exception as e:
             self.logger.error(f"❌ Error in user group sync: {e}", exc_info=True)
-            raise
-
 
     async def _get_initial_delta_link(self) -> Optional[str]:
         """
@@ -793,15 +797,12 @@ class OneDriveConnector(BaseConnector):
         # Process all groups concurrently using asyncio.gather
         results = await asyncio.gather(
             *[self._process_single_group(group) for group in groups],
-            return_exceptions=True
         )
 
         # Filter out None results (failed groups) and exceptions
         group_with_members = []
         for result in results:
-            if isinstance(result, Exception):
-                self.logger.error(f"❌ Error processing group: {result}", exc_info=True)
-            elif result is not None:
+            if result is not None:
                 group_with_members.append(result)
 
         if group_with_members:
@@ -854,8 +855,8 @@ class OneDriveConnector(BaseConnector):
         """
 
         if not url:
-            self.logger.warning("No valid URL in sync point, falling back to full delta sync")
-            url = "https://graph.microsoft.com/v1.0/groups/delta"
+            self.logger.error("No URL in sync point, falling back to full delta sync")
+            raise ValueError("No URL in sync point")
 
         self.logger.info("Starting incremental delta sync...")
 
@@ -945,43 +946,12 @@ class OneDriveConnector(BaseConnector):
             True if group creation/update was successful, False otherwise.
         """
         try:
-            # 1. Fetch latest members for this group
-            members = await self.msgraph_client.get_group_members(group.id)
-
-            # 2. Create AppUserGroup entity
-            user_group = AppUserGroup(
-                source_user_group_id=group.id,
-                app_name=self.connector_name,
-                connector_id=self.connector_id,
-                name=group.display_name,
-                description=group.description,
-                source_created_at=group.created_date_time.timestamp() if group.created_date_time else get_epoch_timestamp_in_ms(),
-            )
-
-            # 3. Create AppUser entities for members (filter by type)
-            app_users = []
-            for member in members:
-                # Check the odata type to determine member type
-                odata_type = getattr(member, 'odata_type', None) or (member.additional_data or {}).get('@odata.type', '')
-
-                if '#microsoft.graph.user' in odata_type:
-                    # Direct user member
-                    app_user = self._create_app_user_from_member(member)
-                    if app_user:
-                        app_users.append(app_user)
-
-                elif '#microsoft.graph.group' in odata_type:
-                    # Nested group - fetch its users (one level deep only)
-                    nested_users = await self._get_users_from_nested_group(member)
-                    app_users.extend(nested_users)
-
-                else:
-                    self.logger.debug(f"Skipping member type '{odata_type}' for member {member.id}")
+            user_group_with_members = await self._process_single_group(group)
 
             # 4. Send to processor (wrapped in list as expected by on_new_user_groups)
-            await self.data_entities_processor.on_new_user_groups([(user_group, app_users)])
+            await self.data_entities_processor.on_new_user_groups([user_group_with_members])
 
-            self.logger.info(f"Processed group creation/update for: {group.display_name} with {len(app_users)} user members")
+            self.logger.info(f"Processed group creation/update for: {group.display_name} with {len(user_group_with_members[1])} user members")
             return True
 
         except Exception as e:
@@ -1089,7 +1059,7 @@ class OneDriveConnector(BaseConnector):
             self.logger.info(f"Starting sync for user {user_id}")
 
             # Get current sync state
-            root_url = f"/users/{user_id}/drive/root/delta"
+            root_url = f"users/{user_id}/drive/root/delta"
             sync_point_key = generate_record_sync_point_key(RecordType.DRIVE.value, "users", user_id)
             sync_point = await self.drive_delta_sync_point.read_sync_point(sync_point_key)
 
@@ -1130,11 +1100,9 @@ class OneDriveConnector(BaseConnector):
                         # Save the RecordGroup
                         await self.data_entities_processor.on_new_record_groups([(record_group, [owner_permission])])
                         self.logger.info(f"Created RecordGroup for user {user_id} with drive ID {drive.id}")
-                    else:
-                        self.logger.warning(f"Could not fetch user info for {user_id}, skipping RecordGroup creation")
                 except Exception as e:
-                    self.logger.error(f"Error creating RecordGroup for user {user_id}: {e}", exc_info=True)
-                    # Continue with sync even if RecordGroup creation fails
+                    self.logger.error(f"Error creating RecordGroup for user {user_id}: {e}", exec_info=True)
+                    raise
 
             url = sync_point.get('deltaLink') or sync_point.get('nextLink') if sync_point else None
             if not url:
@@ -1208,7 +1176,7 @@ class OneDriveConnector(BaseConnector):
             self.logger.info(f"Completed delta sync for user {user_id}")
 
         except Exception as ex:
-            self.logger.error(f"❌ Error in delta sync for user {user_id}: {ex}")
+            self.logger.error(f"❌ Error in delta sync for user {user_id}: {ex}", exc_info=True)
             raise
 
     async def _process_users_in_batches(self, users: List[AppUser]) -> None:
@@ -1219,7 +1187,7 @@ class OneDriveConnector(BaseConnector):
             users: List of users to process
         """
         try:
-            all_active_users = await self.data_entities_processor.get_all_active_users()
+            all_active_users = await self.data_entities_processor.get_all_active_users() ##E check failure 
             active_user_emails = {active_user.email.lower() for active_user in all_active_users}
 
             # Filter users to sync (only active users)
@@ -1255,7 +1223,7 @@ class OneDriveConnector(BaseConnector):
             self.logger.info("Completed processing all user batches")
 
         except Exception as e:
-            self.logger.error(f"❌ Error processing users in batches: {e}")
+            self.logger.error(f"❌ Error processing users in batches: {e}", exc_info=True)
             raise
 
     async def _user_has_onedrive(self, user_id: str) -> bool:
@@ -1286,7 +1254,9 @@ class OneDriveConnector(BaseConnector):
                 "404"
             ]):
                 return False
-            raise
+            
+            self.logger.error(f"❌ Error checking if user {user_id} has OneDrive provisioned: {e}")
+            return False
 
     async def _detect_and_handle_permission_changes(self) -> None:
         """
