@@ -607,18 +607,13 @@ class WebConnector(BaseConnector):
 
             self.visited_urls.add(self._normalize_url(url))
 
-            # if file_record:
-            #     webpages_disabled = file_record.mime_type == MimeTypes.HTML.value and not self.indexing_filters.is_enabled(IndexingFilterKey.WEBPAGES, default=True)
-            #     if webpages_disabled:
-            #         file_record.indexing_status = IndexingStatus.AUTO_INDEX_OFF.value
-
-            #         await self.data_entities_processor.on_new_records([(record_update.record, record_update.new_permissions)])
-            if record_update:
-
-                if record_update.record:
-                    webpages_disabled = record_update.record.mime_type == MimeTypes.HTML.value and not self.indexing_filters.is_enabled(IndexingFilterKey.WEBPAGES, default=True)
-                    if webpages_disabled:
-                        record_update.record.indexing_status = IndexingStatus.AUTO_INDEX_OFF.value
+            if record_update is None:
+                return
+            file_record = record_update.record
+            if file_record:
+                is_disabled = self._check_index_filter(file_record)
+                if is_disabled:
+                    file_record.indexing_status = IndexingStatus.AUTO_INDEX_OFF.value
 
                 if record_update.is_updated:
                     await self._handle_record_updates(record_update)
@@ -701,14 +696,7 @@ class WebConnector(BaseConnector):
                 if file_record:
                     self.visited_urls.add(normalized_url)
 
-                    mime_type = file_record.mime_type
-                    is_disabled = False
-                    if mime_type == MimeTypes.HTML.value:
-                        is_disabled = not self.indexing_filters.is_enabled(IndexingFilterKey.WEBPAGES, default=True)
-                    elif mime_type in DOCUMENT_MIME_TYPES:
-                        is_disabled = not self.indexing_filters.is_enabled(IndexingFilterKey.DOCUMENTS, default=True)
-                    elif mime_type in IMAGE_MIME_TYPES:
-                        is_disabled = not self.indexing_filters.is_enabled(IndexingFilterKey.IMAGES, default=True)
+                    is_disabled = self._check_index_filter(file_record)
 
                     if is_disabled:
                         file_record.indexing_status = IndexingStatus.AUTO_INDEX_OFF.value
@@ -939,6 +927,20 @@ class WebConnector(BaseConnector):
             self.logger.warning(f"⚠️ Failed to extract links from {base_url}: {e}")
 
         return links
+
+    def _check_index_filter(self, record: Record) -> bool:
+        """Check if the record should be indexed."""
+        mime_type = record.mime_type
+        is_disabled = False
+
+        if mime_type == MimeTypes.HTML.value:
+            is_disabled = not self.indexing_filters.is_enabled(IndexingFilterKey.WEBPAGES, default=True)
+        elif mime_type in DOCUMENT_MIME_TYPES:
+            is_disabled = not self.indexing_filters.is_enabled(IndexingFilterKey.DOCUMENTS, default=True)
+        elif mime_type in IMAGE_MIME_TYPES:
+            is_disabled = not self.indexing_filters.is_enabled(IndexingFilterKey.IMAGES, default=True)
+
+        return is_disabled
 
     def _is_valid_url(self, url: str, base_url: str) -> bool:
         """Check if a URL should be crawled."""
