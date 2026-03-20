@@ -335,6 +335,7 @@ class WebConnector(BaseConnector):
         self.crawl_type: str = "single"
         self.max_depth: int = 3
         self.max_pages: int = 100
+        self.max_size_mb: int = 10
         self.follow_external: bool = False
         self.restrict_to_start_path: bool = False
         self.start_path_prefix: str = "/"
