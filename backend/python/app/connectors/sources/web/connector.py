@@ -901,13 +901,14 @@ class WebConnector(BaseConnector):
                     current_url, current_depth, referer=referer
                 )
 
+                self.visited_urls.add(normalized_url)
+
                 if record_update is None:
                     continue
 
                 file_record = record_update.record
 
                 if file_record:
-                    self.visited_urls.add(normalized_url)
 
                     is_disabled = self._check_index_filter(file_record)
 
@@ -1000,6 +1001,9 @@ class WebConnector(BaseConnector):
                             + "%s", final_url, self.url_should_contain
                         )
                         return None
+            
+            if final_url != url:
+                self.visited_urls.add(self._normalize_url(final_url))
 
 
             if len(content_bytes) > self.max_size_mb * 1024 * 1024:
