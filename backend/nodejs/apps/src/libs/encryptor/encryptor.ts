@@ -14,10 +14,15 @@ export class EncryptionService {
   private static instance: EncryptionService;
   private algorithm: string;
   private secretKey: string;
+  private readonly isDevMode: boolean;
 
   private constructor(algorithm: string, secretKey: string) {
     this.algorithm = algorithm;
     this.secretKey = secretKey;
+    this.isDevMode = process.env.NODE_ENV?.toLowerCase() === 'development';
+    if (this.isDevMode) {
+      logger.warn('NODE_ENV=development: encryption is DISABLED.');
+    }
   }
 
   static getInstance(algorithm: string, secretKey: string): EncryptionService {
@@ -28,6 +33,10 @@ export class EncryptionService {
   }
 
   public encrypt(text: string): string {
+    if (this.isDevMode) {
+      return text;
+    }
+
     try {
       // Recommended IV length for GCM is 12 bytes
       const iv = crypto.randomBytes(12);
@@ -62,6 +71,10 @@ export class EncryptionService {
       throw new DecryptionError(
         'Decryption failed, could be due to null or undefined encrypted text',
       );
+    }
+
+    if (this.isDevMode) {
+      return encryptedText;
     }
 
     try {

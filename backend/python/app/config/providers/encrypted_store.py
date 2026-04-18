@@ -46,20 +46,25 @@ class EncryptedKeyValueStore(KeyValueStore[T], Generic[T]):
 
         self.logger.debug("Initializing EncryptedKeyValueStore")
 
-        # Get and hash the secret key to ensure 32 bytes
-        secret_key = os.getenv("SECRET_KEY")
-        if not secret_key:
-            raise ValueError("SECRET_KEY environment variable is required")
+        self.is_dev_mode = os.getenv("NODE_ENV", "").lower() == "development"
 
-        # Hash the secret key to get exactly 32 bytes and convert to hex
-        hashed_key = hashlib.sha256(secret_key.encode()).digest()
-        hex_key = hashed_key.hex()
-        self.logger.debug("Secret key hashed to 32 bytes and converted to hex")
+        if self.is_dev_mode:
+            self.logger.warning("NODE_ENV=development: encryption is DISABLED.")
+            self.encryption_service = None
+        else:
+            secret_key = os.getenv("SECRET_KEY")
+            if not secret_key:
+                raise ValueError("SECRET_KEY environment variable is required")
 
-        self.encryption_service = EncryptionService.get_instance(
-            "aes-256-gcm", hex_key, logger
-        )
-        self.logger.debug("Initialized EncryptionService")
+            # Hash the secret key to get exactly 32 bytes and convert to hex
+            hashed_key = hashlib.sha256(secret_key.encode()).digest()
+            hex_key = hashed_key.hex()
+            self.logger.debug("Secret key hashed to 32 bytes and converted to hex")
+
+            self.encryption_service = EncryptionService.get_instance(
+                "aes-256-gcm", hex_key, logger
+            )
+            self.logger.debug("Initialized EncryptionService")
 
         # Determine store type from environment
         store_type_str = os.getenv("KV_STORE_TYPE", "etcd").lower()
@@ -195,7 +200,7 @@ class EncryptedKeyValueStore(KeyValueStore[T], Generic[T]):
                 config_node_constants.STORAGE.value,
                 config_node_constants.MIGRATIONS.value,
             ]
-            encrypt_value = key not in EXCLUDED_KEYS
+            encrypt_value = (not self.is_dev_mode) and (key not in EXCLUDED_KEYS)
 
             if encrypt_value:
                 # Encrypt the value
@@ -255,9 +260,8 @@ class EncryptedKeyValueStore(KeyValueStore[T], Generic[T]):
                         config_node_constants.STORAGE.value,
                         config_node_constants.MIGRATIONS.value,
                     ]
-                    needs_decryption = key not in UNENCRYPTED_KEYS
+                    needs_decryption = (not self.is_dev_mode) and (key not in UNENCRYPTED_KEYS)
 
-                    # Get decrypted or raw value
                     value = (
                         self.encryption_service.decrypt(encrypted_value)
                         if needs_decryption
@@ -330,7 +334,7 @@ class EncryptedKeyValueStore(KeyValueStore[T], Generic[T]):
             for encrypted_key in encrypted_keys:
                 try:
                     # Check if key is unencrypted (excluded from encryption)
-                    is_unencrypted = any(encrypted_key.startswith(prefix) for prefix in UNENCRYPTED_PREFIXES)
+                    is_unencrypted = self.is_dev_mode or any(encrypted_key.startswith(prefix) for prefix in UNENCRYPTED_PREFIXES)
 
                     if is_unencrypted:
                         decrypted_key = encrypted_key
