@@ -68,7 +68,7 @@ from app.models.entities import (
     RecordType,
 )
 from app.models.permission import EntityType, Permission, PermissionType
-from app.services.notification.types import NotificationType, NotificationSeverity
+from app.services.notification.types import NotificationType, NotificationSeverity, NotificationRecipientRole
 from app.utils.streaming import create_stream_record_response, stream_content
 from app.utils.time_conversion import get_epoch_timestamp_in_ms
 
@@ -257,8 +257,10 @@ class OneDriveConnector(BaseConnector):
                     "connector_id": self.connector_id,
                     "connector_name": self.connector_name.value,
                     "connector_scope": self.scope,
+                    "send_time_ms": get_epoch_timestamp_in_ms(),  # TESTING ONLY: latency measurement, remove before merging
                 },
-                recipient_user_ids=[self.created_by],
+                # recipient_user_ids=[self.created_by],
+                recipient_roles=[NotificationRecipientRole.EVERYONE]
             )
             raise ValueError(f"Failed to initialize OneDrive credential: {sanitize_azure_error(token_error)}")
 

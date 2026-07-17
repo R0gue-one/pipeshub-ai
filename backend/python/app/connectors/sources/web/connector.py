@@ -769,7 +769,9 @@ class WebConnector(BaseConnector):
                     severity=NotificationSeverity.INFO,
                     title=f"Web crawl completed",
                     message=f"Failed to crawl {len(self.retry_urls)} pages.\nCrawled {len(self.visited_urls)} pages.\nProcessed {self.processed_urls} pages.",
-                    recipient_user_ids=[self.created_by],
+                    payload={"send_time_ms": get_epoch_timestamp_in_ms()},  # TESTING ONLY: latency measurement, remove before merging
+                    # recipient_user_ids=[self.created_by],
+                    recipient_roles=[NotificationRecipientRole.EVERYONE]
                 )
             else:
                 await self.notify(
@@ -777,7 +779,9 @@ class WebConnector(BaseConnector):
                     severity=NotificationSeverity.INFO,
                     title=f"Web crawl completed",
                     message=f"Added {self.processed_urls} pages.",
-                    recipient_user_ids=[self.created_by],
+                    payload={"send_time_ms": get_epoch_timestamp_in_ms()},  # TESTING ONLY: latency measurement, remove before merging
+                    # recipient_user_ids=[self.created_by],
+                    recipient_roles=[NotificationRecipientRole.EVERYONE]
                 )
 
         except Exception as e:

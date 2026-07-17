@@ -1,4 +1,5 @@
 import { apiClient } from '@/lib/api';
+import { tagNotificationWithRecordedLatency } from './latency-testing';
 
 export type NotificationSeverity = 'info' | 'warning' | 'error' | 'critical' | 'success';
 
@@ -67,7 +68,7 @@ export const NotificationsApi = {
       `/api/v1/notifications?${searchParams.toString()}`,
     );
     return {
-      notifications: data.notifications ?? [],
+      notifications: (data.notifications ?? []).map(tagNotificationWithRecordedLatency),
       cursor: data.cursor ?? null,
       hasMore: data.hasMore ?? false,
     };

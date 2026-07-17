@@ -355,8 +355,9 @@ class BaseConnector(ABC):
             return
         org_id = getattr(self.data_entities_processor, "org_id", None) or ""
 
-        if self._suppress_notification(title, message, severity):
-            return
+        # TESTING ONLY: dedup/backoff suppression disabled to allow repeated latency-test triggers. Restore before merging.
+        # if self._suppress_notification(title, message, severity):
+        #     return
         
         connector_type = self.connector_name.value if isinstance(self.connector_name, Connectors) else self.connector_name
         if payload and "redirect_link" in payload:

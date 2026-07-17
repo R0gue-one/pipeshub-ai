@@ -8,6 +8,7 @@ import {
 import { useAuthStore } from '@/lib/store/auth-store';
 import { useNotificationStore } from './store';
 import { NotificationsApi, type NotificationListItem } from './api';
+import { recordNotificationDeliveryLatency } from './latency-testing';
 
 /** Refetch stats (and list when the panel is open) from the server. */
 async function syncNotificationsFromServer(): Promise<void> {
@@ -64,7 +65,7 @@ export function useNotificationSocket(): void {
 
     const onNew = (payload: NotificationListItem) => {
       if (payload._id) {
-        addNotification(payload);
+        addNotification(recordNotificationDeliveryLatency(payload));
       }
     };
 
