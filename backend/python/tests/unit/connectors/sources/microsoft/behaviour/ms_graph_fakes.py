@@ -284,6 +284,8 @@ class FakeRecordsDb:
         self.content_updates: list[Any] = []
         self.permission_updates: list[tuple[Any, list[Any]]] = []
         self.reindexed: list[Any] = []
+        # The store the processor reads stored edges from (the connector's data store provider).
+        self.edge_store: Any = None
 
     def add_active_user(self, email: str) -> None:
         self.active_users.append(type("ActiveUser", (), {"email": email})())
@@ -342,7 +344,13 @@ class FakeRecordsDb:
             return None
         return FileRecord.from_arango_record(stored.to_arango_record(), stored.to_arango_base_record())
 
-    async def on_new_records(self, records_with_permissions: list[tuple[Any, list[Any]]]) -> None:
+    async def on_new_records(
+        self,
+        records_with_permissions: list[tuple[Any, list[Any]]],
+        *,
+        replace_permissions: bool = False,
+    ) -> None:
+        del replace_permissions
         self.record_batches.append([rec for rec, _ in records_with_permissions])
         for record, permissions in records_with_permissions:
             self.records[record.external_record_id] = record
@@ -359,6 +367,19 @@ class FakeRecordsDb:
     async def on_updated_record_permissions(self, record: Record, permissions: list[Any]) -> None:
         self.permission_updates.append((record, list(permissions)))
         self.record_permissions[record.external_record_id] = list(permissions)
+
+    async def inheritance_when_unreadable(self, collection: str, stored_id: Optional[str]) -> bool:
+        """Whether the stored node has an inherit edge, read from the edge store as the processor
+        does; without one, from the flag the node was saved with."""
+        if not stored_id:
+            return False
+        if self.edge_store is not None:
+            return bool(await self.edge_store.get_edges_from_node(f"{collection}/{stored_id}", "inheritPermissions"))
+        stored = (
+            self.record_groups.values() if collection == "recordGroups" else self.records.values()
+        )
+        node = next((n for n in stored if getattr(n, "id", None) == stored_id), None)
+        return bool(node is not None and getattr(node, "inherit_permissions", False))
 
     async def on_record_deleted(self, record_id: str, **_: object) -> None:
         self.deleted.append(record_id)
@@ -378,7 +399,7 @@ class FakeRecordsDb:
             if permissions is not None:
                 self.record_group_permissions[group.external_group_id] = list(permissions)
 
-    async def get_record_group_by_external_id(self, connector_id: str, external_id: str) -> Optional[Any]:
+    async def get_record_group_by_external_id(self, connector_id: str, external_id: str) -> Optional[object]:
         return self.record_groups.get(external_id)
 
     async def on_new_app_users(self, users: list[Any]) -> None:
