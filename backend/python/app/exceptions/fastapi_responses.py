@@ -14,3 +14,9 @@ class Status(Enum):
     PERMISSION_CHECK_UNAVAILABLE = "permission_check_unavailable"
     # A filter the search cannot run as given: malformed, or matching too many records.
     INVALID_FILTER = "invalid_filter"
+    # A selection below app level (record groups, folders, records) that
+    # cannot be searched as asked: too many nodes, a source not yet prepared
+    # for it, or nothing in it the user can read.
+    SELECTION_TOO_LARGE = "selection_too_large"
+    SELECTION_NOT_READY = "selection_not_ready"
+    SELECTION_EMPTY = "selection_empty"
