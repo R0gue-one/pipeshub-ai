@@ -592,6 +592,8 @@
     "noCollectionsAvailable": "No collections available",
     "noCollectionsCreatePrompt": "No collections available. Please create a new one.",
     "seeMoreConnectors": "See More Connectors",
+    "connectMoreApps": "Connect more apps",
+    "connectMoreAppsHint": "More sources in, better answers out.",
     "suggestedInWorkspace": "Suggested in Workspace",
     "createSubFolder": "Create a Sub-Folder",
     "more": "More",
@@ -831,7 +833,7 @@
     "archiveChatConfirm": "Are you sure?",
     "archiveChatDescription": "The chat titled",
     "archiveChatWarning": "will be archived.",
-    "askInContext": "Ask in \"{{title}}\"",
+    "askInContext": "Ask in '{{title}}' anything…",
     "askAnythingInContext": "Ask anything in \"{{title}}\"",
     "expandTable": "Expand table",
     "fullTableView": "Full table view",
@@ -1297,7 +1299,17 @@
     "noConnectorsFound": "No connectors found",
     "treeSearching": "Searching…",
     "treeSearchFailed": "Couldn't search. Try again.",
-    "treeSearchMatches": "Folders and items"
+    "treeSearchMatches": "Folders and items",
+    "nodeSearchTooShort": "Type at least 2 characters",
+    "mentionNodes": "Nodes",
+    "mentionNodesLabel": "Matching nodes",
+    "mentionTypeToSearch": "Type a name to search",
+    "mentionSearching": "Searching…",
+    "mentionNone": "No nodes match",
+    "mentionYourApps": "Your apps",
+    "mentionCollections": "Collections",
+    "mentionBack": "Back",
+    "mentionRemove": "Remove {{name}}"
   },
   "workspaceMenu": {
     "appearance": "Appearance",
@@ -4625,7 +4637,8 @@
     "isAnyOf": "is any of",
     "loadingOptions": "Loading options…",
     "refreshingOptions": "Refreshing options…",
-    "loadingMore": "Loading more…"
+    "loadingMore": "Loading more…",
+    "clear": "Clear {{label}} filter"
   },
   "moveFolder": {
     "moving": "Moving...",

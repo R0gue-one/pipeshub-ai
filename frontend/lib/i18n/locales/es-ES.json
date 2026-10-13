@@ -519,6 +519,8 @@
     "noCollectionsAvailable": "No hay colecciones disponibles",
     "noCollectionsCreatePrompt": "No hay colecciones disponibles. Por favor, crea una nueva.",
     "seeMoreConnectors": "Ver más conectores",
+    "connectMoreApps": "Conectar más apps",
+    "connectMoreAppsHint": "Más fuentes, mejores respuestas.",
     "suggestedInWorkspace": "Sugerido en el espacio de trabajo",
     "createSubFolder": "Crear una subcarpeta",
     "more": "Más",
@@ -1228,7 +1230,17 @@
     "noConnectorsFound": "No se encontraron conectores",
     "treeSearching": "Buscando…",
     "treeSearchFailed": "No se pudo buscar. Inténtalo de nuevo.",
-    "treeSearchMatches": "Carpetas y elementos"
+    "treeSearchMatches": "Carpetas y elementos",
+    "nodeSearchTooShort": "Escribe al menos 2 caracteres",
+    "mentionNodes": "Elementos",
+    "mentionNodesLabel": "Elementos coincidentes",
+    "mentionTypeToSearch": "Escribe un nombre para buscar",
+    "mentionSearching": "Buscando…",
+    "mentionNone": "Ningún elemento coincide",
+    "mentionYourApps": "Sus aplicaciones",
+    "mentionCollections": "Colecciones",
+    "mentionBack": "Atrás",
+    "mentionRemove": "Quitar {{name}}"
   },
   "workspaceMenu": {
     "appearance": "Apariencia",
@@ -4670,7 +4682,8 @@
     "isAnyOf": "es cualquiera de",
     "loadingOptions": "Cargando opciones…",
     "refreshingOptions": "Actualizando opciones…",
-    "loadingMore": "Cargando más…"
+    "loadingMore": "Cargando más…",
+    "clear": "Borrar filtro {{label}}"
   },
   "moveFolder": {
     "moving": "Moviendo...",

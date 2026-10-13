@@ -18,6 +18,10 @@ import type {
 } from '../types';
 import { FolderIcon } from '@/app/components/ui';
 import { KbNodeNameIcon } from '../utils/kb-node-name-icon';
+import { EmptyBadge } from './empty-badge';
+import { TableSkeleton } from '@/app/components/data-display/table-skeleton';
+import { ProgressiveBlur } from '@/app/components/ui/progressive-blur';
+import { rowRevealDelay, rowRevealEndMs } from '../utils/row-reveal';
 import { getIndexStatusIcon } from '@/lib/utils/index-status-icon';
 import { isRateLimitPause } from '@/lib/utils/rate-limit-pause';
 import { LapTimerIcon } from '@/app/components/ui/lap-timer-icon';
@@ -35,7 +39,13 @@ import {
 } from '../utils/reindex-label';
 
 // Union type for items that can be displayed
-type TableItem = KnowledgeBaseItem | KnowledgeHubNode | AllRecordItem;
+export type TableItem = KnowledgeBaseItem | KnowledgeHubNode | AllRecordItem;
+
+/** Extra columns an edition overlay can add after "Updated" (desktop only). */
+export interface KbListExtraColumns {
+  header: React.ReactNode;
+  cell: (item: TableItem) => React.ReactNode;
+}
 
 // Type guard to check if item is KnowledgeHubNode
 function isKnowledgeHubNode(item: TableItem): item is KnowledgeHubNode {
@@ -50,6 +60,14 @@ function isAllRecordDisplayRow(item: TableItem): item is AllRecordItem {
 // Room for the preview, go-to-parent and more buttons.
 const ACTIONS_WIDTH = '104px';
 const ACTION_SLOT: React.CSSProperties = { width: 24, display: 'flex', justifyContent: 'center', flexShrink: 0 };
+const ROW_ACTION_BUTTON: React.CSSProperties = {
+  cursor: 'pointer',
+  width: 24,
+  height: 24,
+  minWidth: 24,
+  padding: 0,
+  borderRadius: 'var(--radius-1)',
+};
 
 interface TableHeaderCellProps {
   label: string;
@@ -57,11 +75,11 @@ interface TableHeaderCellProps {
   sortable?: boolean;
   width?: string;
   flex?: number;
-  sort: SortConfig | AllRecordsSortConfig;
-  onSort: (config: SortConfig | AllRecordsSortConfig) => void;
+  sort?: SortConfig | AllRecordsSortConfig;
+  onSort?: (config: SortConfig | AllRecordsSortConfig) => void;
 }
 
-function TableHeaderCell({
+export function TableHeaderCell({
   label,
   field,
   sortable,
@@ -70,10 +88,10 @@ function TableHeaderCell({
   sort,
   onSort,
 }: TableHeaderCellProps) {
-  const isActive = sortable && field && sort.field === field;
+  const isActive = sortable && field && sort?.field === field;
 
   const handleClick = () => {
-    if (sortable && field) {
+    if (sortable && field && sort && onSort) {
       const newOrder: SortOrder =
         sort.field === field && sort.order === 'asc' ? 'desc' : 'asc';
       onSort({ field, order: newOrder } as SortConfig | AllRecordsSortConfig);
@@ -91,24 +109,25 @@ function TableHeaderCell({
           width,
           flex,
           justifyContent: 'flex-start',
+          height: 36,
           padding: '0 var(--space-2)',
           cursor: 'pointer',
-          backgroundColor: 'transparent'
+          backgroundColor: 'transparent',
         }}
       >
-        <Text size="1" weight="medium" style={{ color: 'var(--slate-9)' }}>
+        <Text size="1" style={{ color: 'var(--neutral-9)', fontWeight: 400 }}>
           {label}
         </Text>
         <MaterialIcon
           name={
             isActive
-              ? sort.order === 'asc'
+              ? sort?.order === 'asc'
                 ? 'arrow_drop_up'
                 : 'arrow_drop_down'
               : 'arrow_drop_down'
           }
           size={16}
-          color={'var(--emerald-11)'}
+          color={'var(--neutral-9)'}
         />
       </Button>
     );
@@ -121,10 +140,11 @@ function TableHeaderCell({
       style={{
         width,
         flex,
+        height: 36,
         padding: '0 var(--space-2)',
       }}
     >
-      <Text size="1" weight="medium" style={{ color: 'var(--slate-9)' }}>
+      <Text size="1" style={{ color: 'var(--neutral-9)', fontWeight: 400 }}>
         {label}
       </Text>
     </Flex>
@@ -148,6 +168,8 @@ interface TableRowProps {
   onMove?: (item: TableItem) => void;
   onDelete?: (item: TableItem) => void;
   onDownload?: (item: TableItem) => void;
+  revealIndex?: number;
+  extraColumns?: KbListExtraColumns | null;
 }
 
 function TableRow({
@@ -167,6 +189,8 @@ function TableRow({
   onMove,
   onDelete,
   onDownload,
+  revealIndex = 0,
+  extraColumns = null,
 }: TableRowProps) {
   const { t } = useTranslation();
   const [isHovered, setIsHovered] = useState(false);
@@ -377,7 +401,7 @@ function TableRow({
     // For KnowledgeBaseItem, use status
     switch (item.status) {
       case 'indexed':
-        return <MaterialIcon name="check_circle" size={16} color="var(--emerald-11)" />;
+        return <MaterialIcon name="check" size={16} color="var(--accent-9)" />;
       case 'processing':
         return <MaterialIcon name="sync" size={16} color="var(--amber-9)" />;
       case 'pending':
@@ -401,6 +425,7 @@ function TableRow({
   return (
     <Flex
       ref={rowRef}
+      className="kb-row-in"
       align="center"
       tabIndex={0}
       role="row"
@@ -408,8 +433,9 @@ function TableRow({
       aria-label={item.name}
       style={{
         height: '60px',
+        animationDelay: rowRevealDelay(revealIndex),
         backgroundColor: isSelected
-          ? 'var(--accent-3)'
+          ? 'var(--accent-a3)'
           : isHovered
           ? 'var(--olive-2)'
           : 'var(--olive-1)',
@@ -434,7 +460,7 @@ function TableRow({
       <Flex
         align="center"
         justify="center"
-        style={{ width: '38px', padding: '0 8px', cursor: showCheckbox ? 'pointer' : 'default' }}
+        style={{ width: '36px', padding: '0 8px', cursor: showCheckbox ? 'pointer' : 'default' }}
         onClick={(e: React.MouseEvent) => e.stopPropagation()}
       >
         {showCheckbox && (
@@ -523,9 +549,11 @@ function TableRow({
                 startEditing();
               } : undefined}
               style={{
-                flex: '1 1 auto',
+                // Shrinks to fit so the badges that follow sit right after the name.
+                flex: '0 1 auto',
                 minWidth: 0,
-                color: 'var(--slate-12)',
+                color: 'var(--neutral-12)',
+                fontWeight: 500,
                 overflow: 'hidden',
                 textOverflow: 'ellipsis',
                 whiteSpace: 'nowrap',
@@ -539,22 +567,7 @@ function TableRow({
         {!isEditing && isKnowledgeHubNode(item) && (
           <DemoSourceBadge connectorId={item.connectorId} />
         )}
-        {isFolder && !item.hasChildren && (
-          <Text
-            size="1"
-            style={{
-              color: 'var(--slate-a11)',
-              background: 'var(--surface-1)',
-              border: '1px solid var(--slate-a7)',
-              borderRadius: 'var(--radius-2)',
-              padding: 'var(--space-1) var(--space-2)',
-              whiteSpace: 'nowrap',
-              flexShrink: 0,
-            }}
-          >
-            Empty
-          </Text>
-        )}
+        {isFolder && !item.hasChildren && <EmptyBadge />}
       </Flex>
 
       {/* Status — tooltip only when an icon exists (avoid empty tooltip when status is null) */}
@@ -582,11 +595,11 @@ function TableRow({
 
       {/* Source — All Records rows only; icon + source name on hover */}
       {showSourceColumn && isAllRecordDisplayRow(item) && (
-        <Flex align="center" justify="center" gap="2" style={{ width: '70px', padding: '0 var(--space-2)' }}>
+        <Flex align="center" justify="start" gap="2" style={{ width: '60px', padding: '0 var(--space-2)' }}>
           <Tooltip content={item.sourceName} side="top" delayDuration={200}>
             <Box style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}>
               {item.sourceType === 'collection' ? (
-                <FolderIcon variant="default" size={16} color="var(--emerald-11)" />
+                <FolderIcon variant="default" size={20} color="var(--accent-9)" />
               ) : (
                 <ConnectorIcon type={item.sourceType} size={16} />
               )}
@@ -598,7 +611,7 @@ function TableRow({
       {/* Size — hidden on mobile to keep the row readable */}
       {!isMobile && (
         <Flex align="center" style={{ width: '89px', padding: '0 var(--space-2)' }}>
-          <Text size="2" style={{ color: 'var(--slate-9)' }}>
+          <Text size="2" style={{ color: 'var(--neutral-9)', fontWeight: 500 }}>
             {isKnowledgeHubNode(item)
               ? formatSize(item.sizeInBytes ?? undefined)
               : formatSize(item.size)
@@ -610,7 +623,7 @@ function TableRow({
       {/* Created — hidden on mobile. Skip when timestamp is 0 (source has no real value). */}
       {!isMobile && (
         <Flex align="center" style={{ width: '147px', padding: '0 var(--space-2)' }}>
-          <Text size="2" style={{ color: 'var(--slate-9)' }}>
+          <Text size="2" style={{ color: 'var(--neutral-9)', fontWeight: 500 }}>
             {isKnowledgeHubNode(item)
               ? (item.createdAt ? formatDate(new Date(item.createdAt).toISOString()) : '-')
               : (item.createdAt ? formatDate(item.createdAt) : '-')
@@ -622,7 +635,7 @@ function TableRow({
       {/* Updated — hidden on mobile. Skip when timestamp is 0. */}
       {!isMobile && (
         <Flex align="center" style={{ width: '146px', padding: '0 var(--space-2)' }}>
-          <Text size="2" style={{ color: 'var(--slate-9)' }}>
+          <Text size="2" style={{ color: 'var(--neutral-9)', fontWeight: 500 }}>
             {isKnowledgeHubNode(item)
               ? (item.updatedAt ? formatDate(new Date(item.updatedAt).toISOString()) : '-')
               : (item.updatedAt ? formatDate(item.updatedAt) : '-')
@@ -630,6 +643,8 @@ function TableRow({
           </Text>
         </Flex>
       )}
+
+      {!isMobile && extraColumns ? extraColumns.cell(item) : null}
 
       {/* Actions */}
       {/* A slot per action the list offers, filled or not, so the icons line up from row to row. */}
@@ -647,9 +662,9 @@ function TableRow({
                     e.stopPropagation();
                     onPreview!(item);
                   }}
-                  style={{ cursor: 'pointer' }}
+                  style={ROW_ACTION_BUTTON}
                 >
-                  <MaterialIcon name="visibility" size={16} color="var(--slate-11)" />
+                  <MaterialIcon name="visibility" size={16} color="var(--neutral-11)" />
                 </IconButton>
               </Tooltip>
             )}
@@ -672,9 +687,9 @@ function TableRow({
                     e.stopPropagation();
                     onGoToParent!(parentTarget);
                   }}
-                  style={{ cursor: 'pointer' }}
+                  style={ROW_ACTION_BUTTON}
                 >
-                  <MaterialIcon name="north_west" size={16} color="var(--slate-11)" />
+                  <MaterialIcon name="north_west" size={16} color="var(--neutral-11)" />
                 </IconButton>
               </Tooltip>
             )}
@@ -727,7 +742,7 @@ interface KbListViewProps {
   onSelectItem: (id: string) => void;
   onItemClick: (item: TableItem) => void;
   onSort: (config: SortConfig | AllRecordsSortConfig) => void;
-  onCursorChange?: (cursor: string | null) => void;
+  onCursorChange?: (cursor: string | null, direction?: 'next' | 'prev') => void;
   onLimitChange?: (limit: number) => void;
   onPreview?: (item: TableItem) => void;
   /** Set while the rows are search or filter results: each row then offers its parent. */
@@ -738,7 +753,13 @@ interface KbListViewProps {
   onMove?: (item: TableItem) => void;
   onDelete?: (item: TableItem) => void;
   onDownload?: (item: TableItem) => void;
+  extraColumns?: KbListExtraColumns | null;
+  /** Rows are on their way: hold the header and shimmer the body until they land. */
+  loading?: boolean;
 }
+
+const SKELETON_ROWS = 18;
+const SKELETON_FADE_MS = 180;
 
 export function KbListView({
   items,
@@ -762,8 +783,19 @@ export function KbListView({
   onMove,
   onDelete,
   onDownload,
+  extraColumns = null,
+  loading = false,
 }: KbListViewProps) {
+  const { t } = useTranslation();
   const isMobile = useIsMobile();
+  // After a load the skeleton stays under the rows while they land one by one,
+  // so each placeholder is replaced in place instead of the body going blank.
+  const [revealing, setRevealing] = useState(false);
+  const [wasLoading, setWasLoading] = useState(loading);
+  if (wasLoading !== loading) {
+    setWasLoading(loading);
+    setRevealing(wasLoading && !loading);
+  }
 
   return (
     <>
@@ -771,7 +803,7 @@ export function KbListView({
       <Flex
         align="center"
         style={{
-          height: 'var(--space-9)',
+          height: 36,
           borderBottom: '1px solid var(--olive-3)',
           backgroundColor: 'var(--olive-2)',
           backdropFilter: 'blur(8px)',
@@ -782,7 +814,7 @@ export function KbListView({
         <Flex
           align="center"
           justify="center"
-          style={{ width: '38px', padding: '0 var(--space-2)', cursor: showCheckbox ? 'pointer' : 'default' }}
+          style={{ width: '36px', padding: '0 var(--space-2)', cursor: showCheckbox ? 'pointer' : 'default' }}
           onClick={(e: React.MouseEvent) => e.stopPropagation()}
         >
           {showCheckbox && (
@@ -803,7 +835,7 @@ export function KbListView({
 
         {/* Source - Only shown in All Records mode */}
         {showSourceColumn && (
-          <TableHeaderCell label="Source" width="70px" sort={sort} onSort={onSort} />
+          <TableHeaderCell label="Source" width="60px" sort={sort} onSort={onSort} />
         )}
 
         {/* Size — hidden on mobile */}
@@ -821,18 +853,59 @@ export function KbListView({
           <TableHeaderCell label="Updated" field="updatedAt" sortable width="146px" sort={sort} onSort={onSort} />
         )}
 
+        {!isMobile && extraColumns ? extraColumns.header : null}
+
         {/* Actions */}
         <Box style={{ width: ACTIONS_WIDTH }} />
       </Flex>
 
       {/* Table Body */}
+      <Box style={{ position: 'relative', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+      {(loading || revealing) && (
+        <Box
+          role={loading ? 'status' : undefined}
+          aria-label={loading ? t('common.loading', { defaultValue: 'Loading' }) : undefined}
+          onAnimationEnd={(e) => {
+            if (e.target === e.currentTarget) setRevealing(false);
+          }}
+          style={{
+            position: 'absolute',
+            inset: 0,
+            overflow: 'hidden',
+            pointerEvents: 'none',
+            animation: loading
+              ? undefined
+              : `kbSkeletonOut ${SKELETON_FADE_MS}ms ease-out ${rowRevealEndMs(items.length)}ms forwards`,
+          }}
+        >
+          <TableSkeleton
+            rows={SKELETON_ROWS}
+            rowHeight={60}
+            checkboxWidth={36}
+            actionsWidth={104}
+            columns={[
+              { barWidth: 0.62 },
+              { width: '60px', barWidth: 0.45 },
+              ...(showSourceColumn ? [{ width: '60px', barWidth: 0.45 }] : []),
+              ...(!isMobile
+                ? [
+                    { width: '89px', barWidth: 0.55 },
+                    { width: '147px', barWidth: 0.7 },
+                    { width: '146px', barWidth: 0.7 },
+                  ]
+                : []),
+            ]}
+          />
+        </Box>
+      )}
       <Box
         className="no-scrollbar"
-        style={{ flex: 1, overflowY: 'auto' }}
+        style={{ position: 'relative', flex: 1, minHeight: 0, overflowY: 'auto' }}
       >
-        {items.map((item) => (
+        {items.map((item, index) => (
           <TableRow
             key={item.id}
+            revealIndex={index}
             item={item}
             isSelected={selectedItems.has(item.id)}
             showSourceColumn={showSourceColumn}
@@ -849,8 +922,13 @@ export function KbListView({
             onMove={onMove}
             onDelete={onDelete}
             onDownload={onDownload}
+            extraColumns={extraColumns}
           />
         ))}
+        <Box style={{ height: 96 }} />
+      </Box>
+      {/* Rows dissolve under the floating composer dock instead of meeting it at a hard edge. */}
+      <ProgressiveBlur height={104} />
       </Box>
 
       {/* Pagination */}
@@ -859,28 +937,33 @@ export function KbListView({
           justify="between"
           align="center"
           style={{
+            position: 'relative',
+            zIndex: 16,
             padding: 'var(--space-2) var(--space-4)',
             borderTop: '1px solid var(--olive-3)',
-            borderBottom: '1px solid var(--olive-3)',
             background: 'var(--olive-2)',
-            backdropFilter: 'blur(8px)',
             flexShrink: 0,
           }}
         >
-          <Text size="2" style={{ color: 'var(--slate-9)' }}>
+          <Text size="2" style={{ color: 'var(--neutral-9)', fontWeight: 400, lineHeight: '20px' }}>
             Showing {pagination.startIndex ?? 0}-{pagination.endIndex ?? 0} of {pagination.totalItems} Items
           </Text>
-          <Flex gap="3" align="center">
+          <Flex gap="2" align="center">
             {/* Previous Button */}
             <Flex
               align="center"
-              gap="1"
+              gap="2"
               style={{
+                height: 32,
+                padding: '0 12px',
+                borderRadius: 'var(--radius-2)',
                 cursor: pagination.hasPrev ? 'pointer' : 'not-allowed',
-                opacity: pagination.hasPrev ? 1 : 0.5,
-                color: 'var(--slate-11)',
+                color: pagination.hasPrev ? 'var(--neutral-11)' : 'var(--neutral-a8)',
               }}
-              onClick={() => pagination.hasPrev && onCursorChange?.(pagination.prevCursor ?? null)}
+              onClick={() => {
+                if (!pagination.hasPrev) return;
+                onCursorChange?.(pagination.prevCursor ?? null, 'prev');
+              }}
             >
               <MaterialIcon name="chevron_left" size={16} />
               <Text size="2">Previous</Text>
@@ -890,14 +973,18 @@ export function KbListView({
                 number of its own, and inventing one server-side would be a lie. */}
             <Box
               style={{
-                padding: 'var(--space-1) var(--space-3)',
-                backgroundColor: 'var(--slate-3)',
+                height: 32,
+                padding: '0 12px',
+                backgroundColor: 'var(--neutral-a5)',
                 borderRadius: 'var(--radius-2)',
                 minWidth: '32px',
-                textAlign: 'center',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                opacity: 0.92,
               }}
             >
-              <Text size="2" weight="medium" style={{ color: 'var(--slate-12)' }}>
+              <Text size="2" weight="medium" style={{ color: 'var(--neutral-11)', lineHeight: '20px' }}>
                 {Math.floor(((pagination.startIndex ?? 1) - 1) / Math.max(1, pagination.limit)) + 1}
               </Text>
             </Box>
@@ -905,20 +992,25 @@ export function KbListView({
             {/* Next Button */}
             <Flex
               align="center"
-              gap="1"
+              gap="2"
               style={{
+                height: 32,
+                padding: '0 12px',
+                borderRadius: 'var(--radius-2)',
                 cursor: pagination.hasNext ? 'pointer' : 'not-allowed',
-                opacity: pagination.hasNext ? 1 : 0.5,
-                color: 'var(--slate-11)',
+                color: pagination.hasNext ? 'var(--neutral-11)' : 'var(--neutral-a8)',
               }}
-              onClick={() => pagination.hasNext && onCursorChange?.(pagination.nextCursor ?? null)}
+              onClick={() => {
+                if (!pagination.hasNext) return;
+                onCursorChange?.(pagination.nextCursor ?? null, 'next');
+              }}
             >
               <Text size="2">Next</Text>
               <MaterialIcon name="chevron_right" size={16} />
             </Flex>
 
             {/* Separator */}
-            <Box style={{ width: '1px', height: '20px', backgroundColor: 'var(--olive-3)' }} />
+            <Box style={{ width: '1px', height: '8px', backgroundColor: 'var(--neutral-9)' }} />
 
             {/* Rows per page selector */}
             <DropdownMenu.Root>
@@ -928,15 +1020,16 @@ export function KbListView({
                   gap="1"
                   style={{
                     cursor: 'pointer',
-                    padding: 'var(--space-1) var(--space-2)',
-                    backgroundColor: 'var(--slate-3)',
+                    height: 32,
+                    padding: '0 12px',
+                    backgroundColor: 'var(--neutral-a3)',
                     borderRadius: 'var(--radius-2)',
                   }}
                 >
-                  <Text size="2" style={{ color: 'var(--slate-12)' }}>
+                  <Text size="2" weight="medium" style={{ color: 'var(--neutral-11)', lineHeight: '20px' }}>
                     {pagination.limit}
                   </Text>
-                  <MaterialIcon name="expand_less" size={14} color="var(--slate-11)" />
+                  <MaterialIcon name="expand_less" size={16} color="var(--neutral-11)" />
                 </Flex>
               </DropdownMenu.Trigger>
               <DropdownMenu.Content align="end" sideOffset={4}>
