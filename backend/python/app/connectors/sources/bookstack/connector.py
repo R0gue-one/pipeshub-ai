@@ -1450,7 +1450,7 @@ class BookStackConnector(BaseConnector):
 
         return permissions_list
 
-    async def _sync_record_groups_incremental(self, last_sync_timestamp: str, roles_details: Dict[int, Dict]) -> bool:
+    async def _sync_record_groups_incremental(self, last_sync_timestamp: str, roles_details: dict[int, dict]) -> bool:
         """
         Sync all record groups (books, shelves and chapter) from BookStack as RecordGroup objects, handling new/updated/deleted record groups.
 
@@ -1678,7 +1678,7 @@ class BookStackConnector(BaseConnector):
         existing.rewrite_permissions = True
         await self.data_entities_processor.on_updated_record_permissions(existing, list(grants))
 
-    async def _handle_record_group_delete_event(self, event: Dict, content_type: str) -> bool:
+    async def _handle_record_group_delete_event(self, event: dict, content_type: str) -> bool:
         """Remove a deleted shelf, book or chapter with everything below it, once BookStack confirms it is gone.
 
         BookStack sends no page_delete for the pages of a deleted chapter or book,
