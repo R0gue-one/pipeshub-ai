@@ -1375,8 +1375,9 @@ class BookStackConnector(BaseConnector):
         content_type_name: str,
         parent_roles: dict[int, PermissionType] | None = None,
     ) -> list[Permission]:
-        """Owner, plus role grants that are not already supplied by the parent."""
+        """Owner where ownership grants access, plus role grants not already supplied by the parent."""
         owner_permission = None
+        owner_role_ids: list[int] = []
         owner = permissions_data.get("owner")
         if owner and owner.get("id"):
             try:
@@ -1388,11 +1389,14 @@ class BookStackConnector(BaseConnector):
                         type=PermissionType.OWNER,
                         entity_type=EntityType.USER,
                     )
+                    owner_role_ids = [
+                        int(role["id"]) for role in user_response.data.get("roles") or [] if role.get("id") is not None
+                    ]
             except Exception as e:
                 self.logger.error(f"Failed to fetch owner details for user ID {owner.get('id')}: {e}")
 
         return bookstack_grants(
-            owner_permission, permissions_data, roles_details, content_type_name, parent_roles
+            owner_permission, permissions_data, roles_details, content_type_name, parent_roles, owner_role_ids
         )
 
     async def _parent_role_access(

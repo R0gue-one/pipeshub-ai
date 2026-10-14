@@ -849,8 +849,8 @@ class TestParseBookstackPermissions:
             "fallback_permissions": {},
         }
         result = await connector._parse_bookstack_permissions(data, {}, "book")
-        assert len(result) == 1
-        assert result[0].type == PermissionType.OWNER
+        # Everyone Else does not inherit, so it overrides every role and ownership grants nothing.
+        assert result == []
 
     @pytest.mark.asyncio
     async def test_owner_no_email(self, connector):
