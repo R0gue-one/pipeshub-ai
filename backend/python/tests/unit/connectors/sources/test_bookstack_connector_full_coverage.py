@@ -1982,7 +1982,7 @@ class TestBookStackCoverageGaps:
         connector.data_source.list_audit_log = AsyncMock(side_effect=[
             _make_response(data={"data": []}),
             _make_response(data={"data": [{"detail": "(1) UpdatedBook"}]}),
-            _make_response(data={"data": [{"detail": "(2) DeletedBook"}]}),
+            _make_response(data={"data": [{"detail": "(2) DeletedBook"}], "total": 1}),
             _make_response(data={"data": [{"detail": "(3) PermBook", "loggable_type": "book"}]}),
         ])
         connector._handle_record_group_create_event = AsyncMock()
