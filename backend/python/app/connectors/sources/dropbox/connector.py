@@ -110,6 +110,11 @@ from app.utils.streaming import create_stream_record_response, stream_content
 
 
 
+# How far up, and how many members, a delete's existence check looks: it runs only
+# when the reporting member no longer sees the item, so it stays a handful of calls.
+_ACCESS_ANCESTOR_HOPS = 6
+_MAX_MEMBERS_TO_ASK = 5
+
 # Team-log sharing events after which an item's members are read again.
 SHARING_CHANGE_EVENTS = frozenset({
     "shared_content_add_member",
@@ -688,25 +693,42 @@ class DropboxConnector(BaseConnector):
             return None
 
     async def _team_item_still_exists(self, record: Record, member_id: str) -> bool | None:
-        """Whether a deleted path's record still resolves by id.
+        """Whether a deleted path's record still resolves by id for anyone who can open it.
 
-        Asked as the member whose listing reported the delete, then as the member
-        whose sync wrote the record: a member who only left a shared folder sees
-        a delete there while the owner still has the item.
+        A member who leaves a shared folder sees a delete there while the owner
+        keeps the item, so the id is asked as the reporting member first, then as
+        each member the graph says can open the record or a folder above it, and
+        the member whose sync wrote the record. Stops at the first that resolves.
         """
-        members = [member_id]
-        owner = record.external_record_group_id
-        if owner and owner.startswith("dbmid:") and owner != member_id:
-            members.append(owner)
-        answers = [
-            item_still_exists(await self.data_source.files_get_metadata(
+        unknown = False
+        for member in await self._members_to_ask(record, member_id):
+            answer = item_still_exists(await self.data_source.files_get_metadata(
                 path=record.external_record_id, team_member_id=member,
             ))
-            for member in members
-        ]
-        if any(answers):
-            return True
-        return None if None in answers else False
+            if answer:
+                return True
+            unknown = unknown or answer is None
+        return None if unknown else False
+
+    async def _members_to_ask(self, record: Record, member_id: str) -> list[str]:
+        """The reporting member, the members granted on the record or the folders above it, and its writer."""
+        members = [member_id]
+        node: Record | None = record
+        for _ in range(_ACCESS_ANCESTOR_HOPS):
+            if node is None or len(members) > _MAX_MEMBERS_TO_ASK:
+                break
+            for user in await self.data_entities_processor.get_users_with_permission_to_node(
+                node.id, CollectionNames.RECORDS.value
+            ):
+                app_user = await self.data_entities_processor.get_app_user_by_email(user.email, self.connector_id) if user.email else None
+                if app_user and app_user.source_user_id not in members:
+                    members.append(app_user.source_user_id)
+            parent = node.parent_external_record_id
+            node = await self.data_entities_processor.get_record_by_external_id(self.connector_id, parent) if parent else None
+        writer = record.external_record_group_id
+        if writer and writer.startswith("dbmid:") and writer not in members:
+            members.append(writer)
+        return members[: _MAX_MEMBERS_TO_ASK + 1]
 
     async def _process_dropbox_items_generator(
         self, entries: List[Union[FileMetadata, FolderMetadata, DeletedMetadata]], user_id: str, user_email: str, record_group_id: str, is_person_folder: bool,

@@ -121,6 +121,10 @@ def team_connector() -> DropboxConnector:
     connector.sync_filters = FilterCollection()
     connector.indexing_filters = FilterCollection()
     connector.data_source = AsyncMock()
+    processor = connector.data_entities_processor
+    processor.get_users_with_permission_to_node = AsyncMock(return_value=[])
+    processor.get_app_user_by_email = AsyncMock(return_value=None)
+    processor.get_record_by_external_id = AsyncMock(return_value=None)
     return connector
 
 
@@ -143,6 +147,27 @@ class TestTeamConnector:
         team_connector.data_source.files_get_metadata = AsyncMock(side_effect=lookup)
 
         assert await team_connector._team_item_still_exists(_record(group=OWNER), MEMBER) is True
+
+    @pytest.mark.asyncio
+    async def test_an_owner_granted_on_a_folder_above_keeps_the_item(self, team_connector) -> None:
+        """The record was last written from the leaving member's own view, so its writer is that member."""
+        holder = "dbmid:folder-owner"
+        processor = team_connector.data_entities_processor
+        folder = MagicMock(id="rec-folder", parent_external_record_id=None)
+        processor.get_record_by_external_id = AsyncMock(return_value=folder)
+        processor.get_users_with_permission_to_node = AsyncMock(
+            side_effect=lambda node_id, _c: [MagicMock(email="owner@x.com")] if node_id == "rec-folder" else []
+        )
+        processor.get_app_user_by_email = AsyncMock(return_value=MagicMock(source_user_id=holder))
+
+        async def lookup(path: str, team_member_id: str) -> DropboxResponse:
+            return _found() if team_member_id == holder else NOT_FOUND
+
+        team_connector.data_source.files_get_metadata = AsyncMock(side_effect=lookup)
+        record = MagicMock(id="rec-1", external_record_id="id:a", external_record_group_id=MEMBER,
+                           parent_external_record_id="id:folder")
+
+        assert await team_connector._team_item_still_exists(record, MEMBER) is True
 
     @pytest.mark.asyncio
     async def test_gone_for_both_the_member_and_the_owner(self, team_connector) -> None:
