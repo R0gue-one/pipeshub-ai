@@ -10,7 +10,13 @@ import pytest
 
 from app.config.constants.arangodb import CollectionNames, Connectors, OriginTypes
 from app.connectors.sources.dropbox.deletes import apply_deleted_entry
-from app.models.entities import FileRecord, RecordGroup, RecordGroupType, RecordType
+from app.models.entities import (
+    AppUserGroup,
+    FileRecord,
+    RecordGroup,
+    RecordGroupType,
+    RecordType,
+)
 from app.models.permission import EntityType, Permission, PermissionType
 
 from ..processor_harness import build_processor
@@ -116,3 +122,22 @@ async def test_a_delete_reported_for_a_move_keeps_the_record(backend) -> None:
 
     assert await apply_deleted_entry(processor, connector_id, "/pr3880/sub/b.txt", still_there, processor.logger)
     assert await _exists(backend, connector_id, moved)
+
+
+async def test_a_member_added_by_an_event_is_a_user_grant_on_the_group(backend) -> None:
+    """DB-03: a member added between full syncs got a GROUP-typed edge, which access queries never follow."""
+    processor, _ = build_processor(backend.provider, ORG)
+    connector_id = f"conn-{_suffix()}"
+    await _drive(backend, processor, connector_id)
+    email = f"member-{_suffix()}@example.com"
+    user_id = await _seed_user(backend, email)
+    group = AppUserGroup(source_user_group_id=f"g:{_suffix()}", app_name=Connectors.DROPBOX, connector_id=connector_id, name="Testers")
+    await processor.on_new_user_groups([(group, [])])
+
+    assert await processor.on_user_group_member_added(group.source_user_group_id, email, PermissionType.WRITE, connector_id)
+
+    stored = await backend.provider.get_user_group_by_external_id(connector_id, group.source_user_group_id)
+    edge = await backend.provider.get_edge(
+        user_id, CollectionNames.USERS.value, stored.id, CollectionNames.GROUPS.value, CollectionNames.PERMISSION.value,
+    )
+    assert edge is not None and edge["type"] == "USER"

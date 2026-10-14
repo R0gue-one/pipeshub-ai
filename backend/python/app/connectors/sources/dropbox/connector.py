@@ -2332,11 +2332,12 @@ class DropboxConnector(BaseConnector):
                 )
                 return False
 
+            # A membership is the user's grant on the group: typed USER, as access queries expect.
             permission = Permission(
                 external_id=user.id,
                 email=user_email,
                 type=new_permission_type,
-                entity_type=EntityType.GROUP,
+                entity_type=EntityType.USER,
             )
             await self.data_entities_processor.upsert_permission_edge(
                 from_id=user.id,

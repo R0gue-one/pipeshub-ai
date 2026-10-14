@@ -5028,12 +5028,14 @@ class DataSourceEntitiesProcessor:
                     self.logger.debug(f"Permission edge already exists between {user_email} and group {user_group.name}")
                     return False
 
-                # 4. Create the permission object (external_id is not used when storing in arango)
+                # 4. Create the permission object (external_id is not used when storing in arango).
+                # A membership is the user's grant on the group, typed USER like the ones
+                # on_new_user_groups writes: access queries follow only USER edges into a group.
                 permission = Permission(
                     external_id=user.id,
                     email=user_email,
                     type=permission_type,
-                    entity_type=EntityType.GROUP
+                    entity_type=EntityType.USER
                 )
 
                 # 5. Create new permission edge since it doesn't exist
