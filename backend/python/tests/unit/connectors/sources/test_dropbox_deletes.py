@@ -13,8 +13,13 @@ from dropbox.files import DeletedMetadata
 
 from app.connectors.core.registry.filters import FilterCollection
 from app.connectors.sources.dropbox.connector import DropboxConnector
-from app.connectors.sources.dropbox.deletes import apply_deleted_entry, item_still_exists
-from app.connectors.sources.dropbox_individual.connector import DropboxIndividualConnector
+from app.connectors.sources.dropbox.deletes import (
+    apply_deleted_entry,
+    item_still_exists,
+)
+from app.connectors.sources.dropbox_individual.connector import (
+    DropboxIndividualConnector,
+)
 from app.sources.client.dropbox.dropbox_ import DropboxResponse
 
 LOGGER = logging.getLogger("dropbox-deletes")

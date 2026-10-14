@@ -41,9 +41,6 @@ from app.models.entities import (
 from app.models.permission import EntityType, Permission, PermissionType
 
 from .processor_harness import build_processor
-
-pytestmark = pytest.mark.integration
-
 from .write_path_support import (
     ORG,
     TS,
@@ -54,6 +51,9 @@ from .write_path_support import (
     _seed_user,
     _suffix,
 )
+
+pytestmark = pytest.mark.integration
+
 
 @pytest.fixture(params=["arango", "neo4j"])
 def backend(request, arango_provider, arango_settings, neo4j_provider, neo4j_settings) -> _ArangoBackend | _Neo4jBackend:
