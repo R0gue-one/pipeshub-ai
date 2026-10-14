@@ -2586,11 +2586,14 @@ class DataSourceEntitiesProcessor:
         pending_moves: list[PendingMove] = []
         should_publish = False
         processed_record: Record | None = None
-        replace = bool(record.rewrite_permissions)
+        # A content update that brings no grants must keep the stored ones: a
+        # record flagged ``rewrite_permissions`` would otherwise be rewritten
+        # with nothing and lose all access. Only an explicit list (even []) replaces.
+        replace = permissions is not None and bool(record.rewrite_permissions)
         async with self._drop_access_after(narrowed_connectors), self._sync_transaction() as tx_store:
             processed_record, pending_moves = await self._process_record(
                 record,
-                list(permissions or []) if replace else [],
+                list(permissions) if replace else [],
                 tx_store,
                 moved_virtual_record_ids,
                 narrowed_connectors=narrowed_connectors,
