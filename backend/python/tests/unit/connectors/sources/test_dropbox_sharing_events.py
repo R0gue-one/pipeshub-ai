@@ -127,3 +127,32 @@ class TestResyncDescendants:
         re_read = [call.args[0].id for call in connector._process_dropbox_entry.await_args_list]
         assert sorted(re_read) == ["id:a", "id:b", "id:sub"]
         assert connector._handle_record_updates.await_count == 3
+
+
+class TestFolderEvent:
+    @pytest.mark.asyncio
+    async def test_a_shared_folder_is_found_from_the_members_own_root_and_its_subtree_re_read(self, connector) -> None:
+        """Rooted at the folder's own namespace, "ns:<id>" answers not_found, which dropped every folder event."""
+        folder = FolderMetadata(name="v2-open", id="id:open", path_lower="/v2/v2-open")
+        lookups: list[dict] = []
+
+        async def get_metadata(**kwargs) -> DropboxResponse:
+            lookups.append(kwargs)
+            return DropboxResponse(success=True, data=folder)
+
+        connector.data_source.files_get_metadata = AsyncMock(side_effect=get_metadata)
+        connector.data_entities_processor.get_record_by_external_id = AsyncMock(
+            return_value=MagicMock(external_record_group_id=OWNER[0])
+        )
+        connector._process_dropbox_entry = AsyncMock(return_value=MagicMock(is_updated=True))
+        connector._handle_record_updates = AsyncMock()
+        connector._resync_descendants = AsyncMock()
+
+        await connector._resync_record_by_external_id("13667846609", OWNER[0], OWNER[1], is_folder=True)
+
+        assert lookups[0] == {"path": "ns:13667846609", "team_member_id": OWNER[0]}
+        assert all("team_folder_id" not in kwargs for kwargs in lookups)
+        connector._handle_record_updates.assert_awaited_once()
+        connector._resync_descendants.assert_awaited_once_with(
+            "id:open", OWNER[0], OWNER[1], OWNER[0], is_person_folder=True,
+        )

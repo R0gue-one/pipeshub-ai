@@ -2952,12 +2952,12 @@ class DropboxConnector(BaseConnector):
                     team_folder_id=ns_id
                 )
             else:  # It's a Folder
-                # For shared folders, use ns: prefix AND provide team_folder_id
+                # An "ns:<id>" path resolves only from the member's own root: rooted at that
+                # same namespace, Dropbox answers not_found, which dropped every folder event.
                 self.logger.info(f"Fetching FolderMetadata with files/get_metadata for ns:{external_id}")
                 ns_metadata_result = await self.data_source.files_get_metadata(
                     path=f"ns:{external_id}",
                     team_member_id=team_member_id,
-                    team_folder_id=external_id
                 )
 
                 if not ns_metadata_result or not ns_metadata_result.success:
@@ -2970,8 +2970,10 @@ class DropboxConnector(BaseConnector):
                 metadata_result = await self.data_source.files_get_metadata(
                     path=file_id,
                     team_member_id=team_member_id,
-                    team_folder_id=external_id
                 )
+                if not metadata_result.success:
+                    self.logger.error(f"Could not fetch metadata for re-sync: {file_id}. Error: {metadata_result.error}")
+                    return
                 file_id = metadata_result.data.id
 
             if not metadata_result or not metadata_result.success:
