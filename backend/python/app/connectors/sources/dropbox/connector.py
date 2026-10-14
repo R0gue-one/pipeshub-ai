@@ -76,6 +76,7 @@ from app.connectors.core.constants import (
 # App-specific Dropbox client imports
 from app.connectors.sources.dropbox.access import DropboxGrants, member_is_direct
 from app.connectors.sources.dropbox.common.apps import DropboxApp
+from app.connectors.sources.dropbox.deletes import apply_deleted_entry, item_still_exists
 from app.connectors.sources.microsoft.common.msgraph_client import RecordUpdate
 
 # Model imports
@@ -388,6 +389,13 @@ class DropboxConnector(BaseConnector):
             RecordUpdate object containing the record and change information.
         """
         try:
+            # A delete has no id, dates or extension to filter on.
+            if isinstance(entry, DeletedMetadata):
+                await apply_deleted_entry(
+                    self.data_entities_processor, self.connector_id, entry.path_lower,
+                    lambda record: self._team_item_still_exists(record, user_id), self.logger,
+                )
+                return None
 
             # 0. Apply date filters if provided
             if not self._pass_date_filters(entry, modified_after, modified_before, created_after, created_before):
@@ -396,37 +404,6 @@ class DropboxConnector(BaseConnector):
             if not self._pass_extension_filter(entry):
                 self.logger.debug(f"Skipping item {entry.name} (ID: {entry.id}) due to extention filters.")
                 return
-
-            # 1. Handle Deleted Items (Deletion from db not implemented yet)
-            if isinstance(entry, DeletedMetadata):
-                pass
-                # return None
-                # self.logger.info(f"Item at path '{entry.path_lower}' has been deleted.")
-
-
-                # async with self.data_store_provider.transaction() as tx_store:
-                #     record = await tx_store.get_record_by_path(
-                #         connector_id=self.connector_id,
-                #         path=entry.path_lower,
-                #     )
-
-                # print("GOING TO RUN ON_RECORD_DELETED 1: ", record["_key"], record["name"])
-                # await self.data_entities_processor.on_record_deleted(
-                #     record_id=record["_key"]
-                # )
-
-
-                # return RecordUpdate(
-                #     record=None,
-                #     external_record_id=entry.id,
-                #     is_new=False,
-                #     is_updated=False,
-                #     is_deleted=True,
-                #     metadata_changed=False,
-                #     content_changed=False,
-                #     permissions_changed=False
-                # )
-
 
             # 2. Get existing record from the database
             existing_record = await self.data_entities_processor.get_record_by_external_id(
@@ -700,6 +677,27 @@ class DropboxConnector(BaseConnector):
         except Exception as ex:
             self.logger.error(f"Error processing Dropbox entry {getattr(entry, 'id', entry.path_lower)}: {ex}", exc_info=True)
             return None
+
+    async def _team_item_still_exists(self, record: Record, member_id: str) -> bool | None:
+        """Whether a deleted path's record still resolves by id.
+
+        Asked as the member whose listing reported the delete, then as the member
+        whose sync wrote the record: a member who only left a shared folder sees
+        a delete there while the owner still has the item.
+        """
+        members = [member_id]
+        owner = record.external_record_group_id
+        if owner and owner.startswith("dbmid:") and owner != member_id:
+            members.append(owner)
+        answers = [
+            item_still_exists(await self.data_source.files_get_metadata(
+                path=record.external_record_id, team_member_id=member,
+            ))
+            for member in members
+        ]
+        if any(answers):
+            return True
+        return None if None in answers else False
 
     async def _process_dropbox_items_generator(
         self, entries: List[Union[FileMetadata, FolderMetadata, DeletedMetadata]], user_id: str, user_email: str, record_group_id: str, is_person_folder: bool,

@@ -4727,6 +4727,11 @@ class DataSourceEntitiesProcessor:
             )
         await self._access_changed([connector_id])
 
+    async def get_records_by_file_path(self, connector_id: str, path: str) -> list[Record]:
+        """Records of a connector whose file node stores exactly ``path``, trashed or not."""
+        async with self.data_store_provider.transaction() as tx_store:
+            return await tx_store.get_records_by_file_path(connector_id, path)
+
     async def get_record_group_by_external_id(
         self, connector_id: str, external_id: str
     ) -> RecordGroup | None:
