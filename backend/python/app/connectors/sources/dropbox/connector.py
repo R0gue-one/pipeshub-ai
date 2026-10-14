@@ -21,7 +21,7 @@ from dropbox.files import (
 )
 from dropbox.sharing import AccessLevel, LinkAudience, SharedLinkSettings
 from dropbox.team import UserSelectorArg
-from dropbox.team_log import EventCategory
+from dropbox.team_log import EventCategory, TeamEvent
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 
@@ -108,6 +108,15 @@ from app.utils.streaming import create_stream_record_response, stream_content
 
 # from dropbox.team import GroupSelector
 
+
+
+# Team-log sharing events after which an item's members are read again.
+SHARING_CHANGE_EVENTS = frozenset({
+    "shared_content_add_member",
+    "shared_content_remove_member",
+    "shared_content_change_member_role",
+    "shared_content_unshare",
+})
 
 class GroupAccessRemovalError(Exception):
     """A member removal or group deletion in the group event log that could not be saved.
@@ -2806,21 +2815,14 @@ class DropboxConnector(BaseConnector):
                         event_type = event.event_type._tag
 
                         # 1. Check for the correct, specific event types
-                        if event_type in [
-                            "shared_content_add_member",
-                            "shared_content_remove_member",
-                            "shared_content_change_member_role" # This is a likely name for role changes
-                        ]:
+                        if event_type in SHARING_CHANGE_EVENTS:
                             self.logger.info(f"Processing permission change event: {event_type}")
 
-                            # 2. Get the actor's information
-                            actor = event.actor.get_admin() if event.actor.is_admin() else event.actor.get_user()
-                            if not actor:
-                                self.logger.warning("Could not determine actor for event. Skipping.")
+                            member = self._sharing_event_member(event)
+                            if member is None:
+                                self.logger.warning(f"{event_type} names no team member to read the item as. Skipping.")
                                 continue
-
-                            team_member_id = actor.team_member_id
-                            user_email = actor.email
+                            team_member_id, user_email = member
 
                             # 3. Iterate through assets to find the file/folder ID (CORRECTED LOGIC)
                             if not event.assets:
@@ -2877,6 +2879,50 @@ class DropboxConnector(BaseConnector):
             sync_point_key,
             sync_point_data={"cursor": latest_cursor_to_save}
         )
+
+    @staticmethod
+    def _sharing_event_member(event: TeamEvent) -> tuple[str, str] | None:
+        """The team member to re-read a shared item as: whose content it is (the event's context).
+
+        The actor is only a fallback. A change made through an app has an app
+        actor, which is no member, and the actor need not have access anyway.
+        """
+        context = event.context
+        if context is not None and context.is_team_member():
+            info = context.get_team_member()
+            return info.team_member_id, info.email
+        actor = event.actor
+        for is_kind, get in ((actor.is_user, actor.get_user), (actor.is_admin, actor.get_admin)):
+            if is_kind():
+                info = get()
+                if getattr(info, "team_member_id", None):
+                    return info.team_member_id, info.email
+        return None
+
+    async def _resync_descendants(
+        self, folder_external_id: str, member_id: str, member_email: str,
+        record_group_id: str, *, is_person_folder: bool,
+    ) -> None:
+        """Re-read the access of everything stored below a folder whose sharing changed.
+
+        Items under a shared folder can carry their own member edges, so re-reading
+        the folder alone leaves a removed member on them.
+        """
+        pending = [folder_external_id]
+        while pending:
+            parent = pending.pop()
+            for child in await self.data_entities_processor.get_records_by_parent(self.connector_id, parent):
+                result = await self.data_source.files_get_metadata(path=child.external_record_id, team_member_id=member_id)
+                if not result.success:
+                    self.logger.warning(f"Could not re-read {child.external_record_id} below {folder_external_id}: {result.error}")
+                    continue
+                update = await self._process_dropbox_entry(
+                    result.data, member_id, member_email, record_group_id, is_person_folder,
+                )
+                if update and update.is_updated:
+                    await self._handle_record_updates(update)
+                if isinstance(result.data, FolderMetadata):
+                    pending.append(child.external_record_id)
 
     async def _resync_record_by_external_id(
         self,
@@ -2965,6 +3011,10 @@ class DropboxConnector(BaseConnector):
                 await self._handle_record_updates(record_update)
             else:
                 self.logger.info(f"Re-sync for {external_id} did not result in an update.")
+            if isinstance(entry, FolderMetadata):
+                await self._resync_descendants(
+                    entry.id, team_member_id, user_email, record_group_id, is_person_folder=is_person_folder,
+                )
 
         except Exception as e:
             self.logger.error(f"Error during single record re-sync for {external_id}: {e}", exc_info=True)

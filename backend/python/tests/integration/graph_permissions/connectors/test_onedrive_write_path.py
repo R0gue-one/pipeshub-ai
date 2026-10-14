@@ -15,8 +15,17 @@ from msgraph.generated.models.permission import Permission as GraphPermission
 from msgraph.generated.models.sharing_link import SharingLink
 
 from app.config.constants.arangodb import CollectionNames, Connectors, OriginTypes
-from app.connectors.sources.microsoft.onedrive.connector import TENANT_MEMBERS_GROUP_ID, OneDriveConnector
-from app.models.entities import AppUser, FileRecord, RecordGroup, RecordGroupType, RecordType
+from app.connectors.sources.microsoft.onedrive.connector import (
+    TENANT_MEMBERS_GROUP_ID,
+    OneDriveConnector,
+)
+from app.models.entities import (
+    AppUser,
+    FileRecord,
+    RecordGroup,
+    RecordGroupType,
+    RecordType,
+)
 
 from ..processor_harness import build_processor
 from ..write_path_support import ORG, _seed_app, _seed_user, _suffix
