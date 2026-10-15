@@ -912,13 +912,13 @@ class Neo4jProvider(NamedEntityGraphMixin, IGraphDBProvider):
             "FOR (n:Record) ON (n.externalRecordId, n.connectorId)"
         )
 
-        # SINGLE: orgId (queried independently and with other fields)
         # SINGLE: File.path (get_records_by_file_path: a delete reported by path only)
         indexes.append(
             "CREATE INDEX file_path IF NOT EXISTS "
             "FOR (n:File) ON (n.path)"
         )
 
+        # SINGLE: orgId (queried independently and with other fields)
         indexes.append(
             "CREATE INDEX record_org_id IF NOT EXISTS "
             "FOR (n:Record) ON (n.orgId)"
