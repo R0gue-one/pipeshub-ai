@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import binascii
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -7,11 +9,14 @@ from logging import Logger
 from typing import AsyncGenerator, Dict, List, NoReturn, Optional, Tuple, Any
 
 from aiolimiter import AsyncLimiter
-from azure.identity.aio import ClientSecretCredential
+from azure.identity.aio import CertificateCredential, ClientSecretCredential
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 from kiota_abstractions.base_request_configuration import RequestConfiguration
 from msgraph import GraphServiceClient
+from msgraph.generated.drives.item.drive_item_request_builder import (
+    DriveItemRequestBuilder,
+)
 from msgraph.generated.groups.groups_request_builder import GroupsRequestBuilder
 from msgraph.generated.models.drive_item import DriveItem
 from msgraph.generated.models.group import Group
@@ -58,11 +63,17 @@ from app.connectors.core.registry.filters import (
     SyncFilterKey,
     load_connector_filters,
 )
+from app.connectors.core.registry.types import FileContentValidationRule, ValidationRuleType
 from app.connectors.sources.microsoft.common.apps import OneDriveApp
 from app.connectors.sources.microsoft.common.msgraph_client import (
     MSGraphClient,
     RecordUpdate,
     map_msgraph_roles_to_permission_type,
+)
+from app.connectors.sources.microsoft.common.sharepoint_permission_scope import (
+    ListPermissionScope,
+    SharePointPermissionScopeReader,
+    drive_item_unique_id,
 )
 from app.exceptions.graph_db_exceptions import GraphQueryError
 from app.models.entities import (
@@ -165,6 +176,28 @@ def _held_page_attempts(sync_point: Optional[dict[str, Any]], url: str) -> int:
     return 0
 
 
+def _decode_pem(value: object, marker: str) -> str | None:
+    """A PEM block as uploaded, or base64 of one; None when it is neither."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if not text.startswith("-----BEGIN"):
+        try:
+            text = base64.b64decode(text, validate=True).decode("utf-8").strip()
+        except (binascii.Error, UnicodeDecodeError):
+            return None
+    return text if f"-----BEGIN {marker}" in text else None
+
+
+def certificate_pem(auth_config: dict[str, Any]) -> bytes | None:
+    """Private key and certificate as one PEM, as Azure's CertificateCredential reads them."""
+    certificate = _decode_pem(auth_config.get("certificate"), "CERTIFICATE")
+    private_key = _decode_pem(auth_config.get("privateKey"), "PRIVATE KEY")
+    if not certificate or not private_key:
+        return None
+    return f"{private_key}\n{certificate}\n".encode("utf-8")
+
+
 @dataclass
 class OneDriveCredentials:
     tenant_id: str
@@ -235,6 +268,61 @@ ONEDRIVE_USER_FAILURE_NOTIFICATIONS: Dict[OneDriveUserStatus, Tuple[str, str]] =
                 required=True,
                 default_value=False
             ),
+            AuthField(
+                name="certificate",
+                display_name="Client Certificate (optional)",
+                placeholder="Click to upload certificate file (.crt, .cer, or .pem)",
+                description=(
+                    "Optional. With the private key, lets the connector read which files and folders inherit "
+                    "their parent's access, so a change to a folder's sharing reaches everything inside it. "
+                    "Needs the SharePoint Sites.Read.All application permission. Without it, each item keeps "
+                    "the access list OneDrive reports for it."
+                ),
+                field_type="FILE",
+                required=False,
+                min_length=0,
+                accepted_file_types=[".crt", ".cer", ".pem"],
+                validation_rules=[
+                    FileContentValidationRule(
+                        type=ValidationRuleType.TEXT_CONTAINS,
+                        pattern="-----BEGIN CERTIFICATE-----",
+                        error_message="Invalid certificate format. Must contain BEGIN CERTIFICATE marker.",
+                    ),
+                    FileContentValidationRule(
+                        type=ValidationRuleType.TEXT_CONTAINS,
+                        pattern="-----END CERTIFICATE-----",
+                        error_message="Invalid certificate format. Must contain END CERTIFICATE marker.",
+                    ),
+                ],
+                is_secret=True,
+            ),
+            AuthField(
+                name="privateKey",
+                display_name="Private Key (PKCS#8, optional)",
+                placeholder="Click to upload private key file (.key or .pem)",
+                description="Optional. The PKCS#8 private key of the client certificate.",
+                field_type="FILE",
+                required=False,
+                min_length=0,
+                accepted_file_types=[".key", ".pem"],
+                validation_rules=[
+                    FileContentValidationRule(
+                        type=ValidationRuleType.TEXT_NOT_CONTAINS,
+                        pattern="-----BEGIN RSA PRIVATE KEY-----",
+                        error_message=(
+                            "Private key must be in PKCS#8 format, not RSA. Convert with: "
+                            "openssl pkcs8 -topk8 -inform PEM -outform PEM -in privatekey.key "
+                            "-out privatekey.key -nocrypt"
+                        ),
+                    ),
+                    FileContentValidationRule(
+                        type=ValidationRuleType.TEXT_CONTAINS,
+                        pattern="-----BEGIN PRIVATE KEY-----",
+                        error_message="Invalid private key format. Must contain BEGIN PRIVATE KEY marker.",
+                    ),
+                ],
+                is_secret=True,
+            ),
         ])
     ])\
     .with_info(CONNECTOR_EMAIL_IDENTITY_INFO)\
@@ -295,6 +383,9 @@ class OneDriveConnector(BaseConnector):
         self.rate_limiter = AsyncLimiter(50, 1)  # 50 requests per second
         self.sync_filters: FilterCollection = FilterCollection()
         self.indexing_filters: FilterCollection = FilterCollection()
+        self.scope_reader: SharePointPermissionScopeReader | None = None
+        # Per drive, read once per run; None when it couldn't be read.
+        self._drive_scopes: dict[str, ListPermissionScope | None] = {}
 
     async def init(self) -> bool:
         config = await self.config_service.get_config(f"/services/connectors/{self.connector_id}/config")
@@ -355,7 +446,73 @@ class OneDriveConnector(BaseConnector):
 
         self.client = GraphServiceClient(self.credential, scopes=["https://graph.microsoft.com/.default"])
         self.msgraph_client = MSGraphClient(self.connector_name, self.connector_id, self.client, self.logger)
+        self.scope_reader = self._build_scope_reader(credentials.tenant_id, credentials.client_id, auth_config)
         return True
+
+    def _build_scope_reader(
+        self, tenant_id: str, client_id: str, auth_config: dict[str, Any]
+    ) -> SharePointPermissionScopeReader | None:
+        """A reader of SharePoint unique permissions, when a certificate is configured."""
+        if not (auth_config.get("certificate") or auth_config.get("privateKey")):
+            self.logger.info(
+                "No client certificate configured: every OneDrive item keeps its own access list, "
+                "with no inheritance from its folder."
+            )
+            return None
+        pem = certificate_pem(auth_config)
+        if pem is None:
+            self.logger.warning(
+                "⚠️ The client certificate or its PKCS#8 private key is missing or not PEM; every OneDrive item "
+                "keeps its own access list, with no inheritance from its folder."
+            )
+            return None
+
+        async def sharepoint_token(resource: str) -> str:
+            # A fresh credential per read: one kept across runs days apart can find its transport closed.
+            async with CertificateCredential(tenant_id=tenant_id, client_id=client_id, certificate_data=pem) as credential:
+                return (await credential.get_token(f"{resource}/.default")).token
+
+        return SharePointPermissionScopeReader(sharepoint_token, self.rate_limiter)
+
+    async def _get_drive_scope(self, drive_id: str) -> ListPermissionScope | None:
+        """Which items of a drive carry their own permissions; None when that can't be read."""
+        if drive_id in self._drive_scopes:
+            return self._drive_scopes[drive_id]
+        scope = None
+        try:
+            query = DriveItemRequestBuilder.DriveItemRequestBuilderGetQueryParameters(select=["id", "sharePointIds"])
+            async with self.rate_limiter:
+                drive = await self.client.drives.by_drive_id(drive_id).get(
+                    request_configuration=RequestConfiguration(query_parameters=query)
+                )
+            sharepoint_ids = getattr(drive, 'share_point_ids', None)
+            list_id = getattr(sharepoint_ids, 'list_id', None)
+            web_url = getattr(sharepoint_ids, 'site_url', None)
+            if not (isinstance(list_id, str) and list_id and isinstance(web_url, str) and web_url):
+                raise ValueError("the drive has no SharePoint list id or site URL")
+            web_url = web_url.rstrip('/')
+            scope = await self.scope_reader.read_list_scope(web_url, f"{web_url}/_api/web/lists(guid'{list_id}')")
+        except Exception as e:
+            self.logger.warning(
+                f"⚠️ Could not read which items of drive {drive_id} inherit their access; this run, each of its "
+                f"items keeps its own access list. Check the certificate and the SharePoint Sites.Read.All "
+                f"application permission: {e}"
+            )
+        self._drive_scopes[drive_id] = scope
+        return scope
+
+    async def _inherits_parent_access(self, item: DriveItem) -> bool:
+        """Whether SharePoint says the item takes its parent folder's access. False when that can't be told."""
+        if self.scope_reader is None or getattr(item, 'root', None) is not None:
+            return False
+        parent = item.parent_reference
+        if not parent or not parent.id or not parent.drive_id:
+            return False
+        unique_id = drive_item_unique_id(item)
+        if unique_id is None:
+            return False
+        scope = await self._get_drive_scope(parent.drive_id)
+        return scope is not None and unique_id not in scope.unique_items
 
     async def _process_delta_item(
         self,
@@ -487,16 +644,19 @@ class OneDriveConnector(BaseConnector):
                 return None
 
             permission_failure = None
-            try:
-                permission_result = await self.msgraph_client.get_file_permission(
-                    item.parent_reference.drive_id if item.parent_reference else None,
-                    item.id,
-                    raise_on_error=True,
-                )
-            except Exception as read_error:
-                permission_failure = _read_failure(f"permissions of item {item.id}", read_error)
-                self.logger.warning(str(permission_failure))
-                permission_result = []
+            # An item that inherits has no grants of its own: Graph would list its parent's.
+            inherits = await self._inherits_parent_access(item)
+            permission_result = []
+            if not inherits:
+                try:
+                    permission_result = await self.msgraph_client.get_file_permission(
+                        item.parent_reference.drive_id if item.parent_reference else None,
+                        item.id,
+                        raise_on_error=True,
+                    )
+                except Exception as read_error:
+                    permission_failure = _read_failure(f"permissions of item {item.id}", read_error)
+                    self.logger.warning(str(permission_failure))
 
             if permission_failure and existing_record is None:
                 # A new file saved with no access stays that way until it next changes.
@@ -508,9 +668,10 @@ class OneDriveConnector(BaseConnector):
             new_permissions = await self._convert_to_permissions(permission_result)
 
             if permission_failure is None:
-                # OneDrive does not say which grants were inherited. Matching the
-                # parent is not inheritance: a later parent share would leak in.
-                file_record.inherit_permissions = False
+                # Graph's list is the item's whole effective access and does not say which
+                # grants were inherited. Only SharePoint's unique-permission flag does:
+                # matching the parent is not inheritance, a later parent share would leak in.
+                file_record.inherit_permissions = inherits
                 file_record.rewrite_permissions = True
                 permissions_changed = True
                 if existing_record:
@@ -827,18 +988,21 @@ class OneDriveConnector(BaseConnector):
 
         for child in children:
             try:
-                try:
-                    child_permissions = await self.msgraph_client.get_file_permission(
-                        drive_id,
-                        child.id,
-                        raise_on_error=True,
-                    )
-                except Exception as read_error:
-                    failure = _read_failure(f"permissions of child item {child.id}", read_error)
-                    self.logger.warning(str(failure))
-                    walk.unread_items.append(child.id)
-                    walk.temporary = walk.temporary or not failure.permanent
-                    child_permissions = None
+                child_inherits = await self._inherits_parent_access(child)
+                child_permissions = []
+                if not child_inherits:
+                    try:
+                        child_permissions = await self.msgraph_client.get_file_permission(
+                            drive_id,
+                            child.id,
+                            raise_on_error=True,
+                        )
+                    except Exception as read_error:
+                        failure = _read_failure(f"permissions of child item {child.id}", read_error)
+                        self.logger.warning(str(failure))
+                        walk.unread_items.append(child.id)
+                        walk.temporary = walk.temporary or not failure.permanent
+                        child_permissions = None
 
                 existing_child_record = await self.data_entities_processor.get_record_by_external_id(
                     self.connector_id, child.id
@@ -846,7 +1010,7 @@ class OneDriveConnector(BaseConnector):
 
                 if child_permissions is not None and existing_child_record:
                     converted_permissions = await self._convert_to_permissions(child_permissions)
-                    existing_child_record.inherit_permissions = False
+                    existing_child_record.inherit_permissions = child_inherits
                     existing_child_record.rewrite_permissions = True
                     await self.data_entities_processor.on_updated_record_permissions(
                         record=existing_child_record,
@@ -1847,6 +2011,7 @@ class OneDriveConnector(BaseConnector):
         """
         try:
             self.logger.info(f"Handling reindex event for record {record_id}")
+            self._drive_scopes = {}
 
             # Get the record from database
             record = await self.data_entities_processor.get_record_by_external_id(
@@ -1930,6 +2095,7 @@ class OneDriveConnector(BaseConnector):
             # scheduled runs that are days apart, causing the HTTP session to timeout
             await self._reinitialize_credential_if_needed()
             self.onedrive_users_synced = 0
+            self._drive_scopes = {}
 
             self.sync_filters, self.indexing_filters = await load_connector_filters(
                 self.config_service, "onedrive", self.connector_id, self.logger
@@ -2048,6 +2214,7 @@ class OneDriveConnector(BaseConnector):
 
             # Reinitialize credential to prevent session timeout issues
             await self._reinitialize_credential_if_needed()
+            self._drive_scopes = {}
 
             # Sync all active users
             users = await self.msgraph_client.get_all_users()
@@ -2103,6 +2270,7 @@ class OneDriveConnector(BaseConnector):
                 return
 
             self.logger.info(f"Starting reindex for {len(records)} OneDrive records")
+            self._drive_scopes = {}
 
             if not self.msgraph_client:
                 self.logger.error("MS Graph client not initialized. Call init() first.")
