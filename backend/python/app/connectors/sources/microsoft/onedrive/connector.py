@@ -1970,6 +1970,12 @@ class OneDriveConnector(BaseConnector):
             enumerates_drive = not url
             if not url:
                 url = ("{+baseurl}" + root_url)
+            # Graph answers a delta link with the sharing-changes preference only if the link was made
+            # with it (410 Resync required otherwise), so the preference follows the link.
+            sharing_changes = bool(sync_point and sync_point.get("sharingChanges"))
+            if enumerates_drive and self.scope_reader is not None:
+                sharing_changes = True
+                await self.drive_delta_sync_point.update_sync_point(sync_point_key, {"sharingChanges": True})
 
             drive_id = await self._user_drive_id(user_id)
             permission_state: dict[str, Any] = {}
@@ -2005,8 +2011,7 @@ class OneDriveConnector(BaseConnector):
                         state=sync_point or {},
                     ),
                     pending_access,
-                    show_sharing_changes=self.scope_reader is not None
-                    or permission_state.get("mode") == PERMISSION_MODE_INHERITANCE,
+                    show_sharing_changes=sharing_changes,
                 )
 
                 if drive_id:
@@ -2137,7 +2142,7 @@ class OneDriveConnector(BaseConnector):
                         cursor.delta_field: delta_link,
                         cursor.held_field: None,
                         cursor.held_attempts_field: 0,
-                        "pendingAccessReads": pending_access,
+                        **({"pendingAccessReads": pending_access} if cursor.key == sync_point_key else {}),
                     }
                 )
                 break
@@ -2170,7 +2175,9 @@ class OneDriveConnector(BaseConnector):
         """
         permission_key = _drive_permissions_key(drive_id)
         if permission_state.get("enumerating") and not permission_state.get("migrationNextLink"):
-            # A first sync just read every item; those it couldn't tell are queued for recheck.
+            # A first sync, or a rewrite whose last step failed, has read every item; those it
+            # couldn't tell are queued for recheck.
+            await self._adopt_sharing_changes_link(user_id, drive_id, pending_access)
             await self._mark_inheritance_mode(drive_id, permission_state)
             return
         if self.scope_reader is None or (
@@ -2198,7 +2205,7 @@ class OneDriveConnector(BaseConnector):
                     next_field="migrationNextLink",
                     held_field="migrationHeldPage",
                     held_attempts_field="migrationHeldPageAttempts",
-                    delta_field=None,
+                    delta_field="migrationDeltaLink",
                     state=permission_state,
                     # Restarting from scratch is for a cursor that stopped working, not for failures spread over a long rewrite.
                     on_progress={"migrationFailures": 0},
@@ -2221,8 +2228,40 @@ class OneDriveConnector(BaseConnector):
             await self.drive_delta_sync_point.update_sync_point(permission_key, update)
             permission_state.update(update)
             return
+        await self._adopt_sharing_changes_link(user_id, drive_id, pending_access)
         await self._verify_scanned_inheritance(drive_id)
         await self._mark_inheritance_mode(drive_id, permission_state)
+
+    async def _adopt_sharing_changes_link(self, user_id: str, drive_id: str, pending_access: list[str]) -> None:
+        """Make the rewrite's delta link the drive's, once the old link has been read to the end.
+
+        The rewrite asked for sharing changes; a link made without that can't be asked for
+        them. The old link is read once more first, so what changed or was deleted before
+        the rewrite started is not lost; what it reads again is applied twice, harmlessly.
+        """
+        user_key = generate_record_sync_point_key(RecordType.DRIVE.value, "users", user_id)
+        permission_key = _drive_permissions_key(drive_id)
+        new_link = (await self.drive_delta_sync_point.read_sync_point(permission_key) or {}).get("migrationDeltaLink")
+        current = await self.drive_delta_sync_point.read_sync_point(user_key) or {}
+        if not new_link or current.get("sharingChanges"):
+            # The drive's own link already reports sharing changes: it stays, as it was read last.
+            await self.drive_delta_sync_point.update_sync_point(permission_key, {"migrationDeltaLink": None})
+            return
+        old_link = current.get("deltaLink") or current.get("nextLink")
+        if old_link:
+            await self._sync_delta_pages(
+                user_id,
+                old_link,
+                _DeltaCursor(
+                    key=user_key, next_field="nextLink", held_field="heldPage",
+                    held_attempts_field="heldPageAttempts", delta_field="deltaLink", state=current,
+                ),
+                pending_access,
+            )
+        await self.drive_delta_sync_point.update_sync_point(
+            user_key, {"deltaLink": new_link, "nextLink": None, "sharingChanges": True}
+        )
+        await self.drive_delta_sync_point.update_sync_point(permission_key, {"migrationDeltaLink": None})
 
     async def _mark_inheritance_mode(self, drive_id: str, permission_state: dict[str, Any]) -> None:
         unknown = self._items_without_known_inheritance.get(drive_id, set())

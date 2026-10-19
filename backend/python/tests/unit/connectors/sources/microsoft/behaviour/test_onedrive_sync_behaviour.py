@@ -1967,6 +1967,24 @@ class TestSharePointRefusals:
         assert db.inherit_edges["f1"] is False
 
 
+def resync_links_made_without_sharing_changes(cloud: MicrosoftCloudStub, feed: TokenFeed) -> list[str]:
+    """Graph's answer to a link made without the sharing-changes preference asked with it: 410.
+
+    Links whose token starts with D were made without it. Returns the links asked wrongly.
+    """
+    wrong: list[str] = []
+
+    def delta(request: httpx.Request) -> httpx.Response:
+        token = MicrosoftCloudStub.query(request).get("token")
+        if request.headers.get("Prefer") and token and token.startswith("D"):
+            wrong.append(token)
+            return graph_error(410, "resyncRequired", "Resync required.")
+        return feed(request)
+
+    cloud.on("GET", DELTA_PATH, delta)
+    return wrong
+
+
 def reordered_drive(tenant: Tenant) -> TokenFeed:
     """``inheritance_drive`` with f1 last: two lookups (d1, f2) reach the cost of a full read, so f1 is answered by it."""
     feed = inheritance_drive(tenant)
@@ -2099,9 +2117,14 @@ class TestMigration:
     """A drive stored before the certificate is rewritten onto inheritance once, without losing changes."""
 
     async def secret_only_then_certificate(self, cloud, tenant, db, checkpoints) -> tuple[TokenFeed, OneDriveConnector]:
+        """Links D* are made without the sharing-changes preference, S* with it (the rewrite's)."""
         feed = inheritance_drive(tenant)
-        feed.by_token["D1"] = page([], delta_link=delta_link("u-ana", "D2"))
-        feed.by_token["D2"] = page([], delta_link=delta_link("u-ana", "D3"))
+        first = feed.by_token[None]
+        feed.by_token[None] = [first, page(first["value"], delta_link=delta_link("u-ana", "S1"))]
+        for n in range(1, 6):
+            feed.by_token[f"D{n}"] = page([], delta_link=delta_link("u-ana", f"D{n + 1}"))
+            feed.by_token[f"S{n}"] = page([], delta_link=delta_link("u-ana", f"S{n + 1}"))
+        resync_links_made_without_sharing_changes(cloud, feed)
         serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
         await (await ready_connector(db, checkpoints)).run_sync()
         assert db.inherit_edges["f1"] is False and perms(db, "f1")
@@ -2126,10 +2149,11 @@ class TestMigration:
         assert (EntityType.USER, "u-cal", "cal@acme.com", PermissionType.READ) in perms(db, "f2")
         assert db.inherit_edges["d1"] is False and db.inherit_edges["root-ana"] is False
         assert permission_state(checkpoints)["mode"] == "inheritance"
-        assert feed.seen == [None, "D1", None], "the normal delta first, then one full enumeration"
-        assert drive_checkpoint(checkpoints)["deltaLink"] == delta_link("u-ana", "D2"), (
-            "the enumeration's own link is thrown away, so changes made while it ran are still read next time"
+        assert feed.seen == [None, "D1", None, "D2"], (
+            "the normal delta, one full enumeration, then the old link once more so nothing deleted meanwhile is missed"
         )
+        assert drive_checkpoint(checkpoints)["deltaLink"] == delta_link("u-ana", "S1")
+        assert drive_checkpoint(checkpoints)["sharingChanges"] is True
         assert len(db.content_updates) == content_updates, "a rewrite of access re-indexes nothing"
 
     async def test_the_rewrite_happens_once(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
@@ -2139,7 +2163,7 @@ class TestMigration:
 
         await connector.run_sync()
 
-        assert feed.seen == [None, "D1", None, "D2"]
+        assert feed.seen == [None, "D1", None, "D2", "S1"]
         assert len(db.permission_updates) == writes
 
     async def test_a_first_sync_with_the_certificate_needs_no_rewrite(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
@@ -2154,22 +2178,23 @@ class TestMigration:
 
     async def test_an_interrupted_rewrite_resumes_where_it_stopped(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
         feed, connector = await self.secret_only_then_certificate(cloud, tenant, db, checkpoints)
-        root, d1, f1, f2 = feed.by_token[None]["value"]
+        root, d1, f1, f2 = feed.by_token[None][-1]["value"]
         feed.by_token[None] = page([root, d1], next_link=delta_link("u-ana", "M2"))
-        feed.by_token["M2"] = [graph_error(400, "invalidRequest", "page unavailable"), page([f1, f2], delta_link=delta_link("u-ana", "M3"))]
+        feed.by_token["M2"] = [graph_error(400, "invalidRequest", "page unavailable"), page([f1, f2], delta_link=delta_link("u-ana", "S1"))]
 
         await connector.run_sync()
         assert permission_state(checkpoints)["migrationNextLink"] == delta_link("u-ana", "M2")
         assert permission_state(checkpoints).get("mode") is None
         await connector.run_sync()
 
-        assert feed.seen == [None, "D1", None, "M2", "D2", "M2"], "resumed from its own cursor, not started over"
+        assert feed.seen == [None, "D1", None, "M2", "D2", "M2", "D3"], "resumed from its own cursor, not started over"
+        assert drive_checkpoint(checkpoints)["deltaLink"] == delta_link("u-ana", "S1")
         assert permission_state(checkpoints)["mode"] == "inheritance"
         assert db.inherit_edges["f1"] is True and db.record_permissions["f1"] == []
 
     async def test_a_rewrite_that_keeps_failing_starts_over(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
         feed, connector = await self.secret_only_then_certificate(cloud, tenant, db, checkpoints)
-        root, d1, *_ = feed.by_token[None]["value"]
+        root, d1, *_ = feed.by_token[None][-1]["value"]
         feed.by_token[None] = page([root, d1], next_link=delta_link("u-ana", "M2"))
         feed.by_token["M2"] = graph_error(400, "invalidRequest", "page unavailable")
         for token in ("D2", "D3", "D4", "D5"):
@@ -2463,7 +2488,7 @@ class TestReviewFindings:
 
     async def test_progress_through_a_long_rewrite_resets_its_failure_count(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
         feed, connector = await TestMigration().secret_only_then_certificate(cloud, tenant, db, checkpoints)
-        root, d1, f1, f2 = feed.by_token[None]["value"]
+        root, d1, f1, f2 = feed.by_token[None][-1]["value"]
         feed.by_token[None] = page([root, d1], next_link=delta_link("u-ana", "M2"))
         feed.by_token["M2"] = [graph_error(400, "invalidRequest", "page unavailable"), page([f1], next_link=delta_link("u-ana", "M3"))]
         feed.by_token["M3"] = graph_error(400, "invalidRequest", "page unavailable")
@@ -2517,3 +2542,36 @@ class TestReviewFindings:
         )
 
         assert result.success is False and "remove the certificate and key" in result.message
+
+
+class TestSharingChangesLink:
+    """The sharing-changes preference follows the delta link it was made with; Graph refuses it otherwise."""
+
+    async def test_adding_a_certificate_never_asks_an_old_link_for_sharing_changes(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
+        feed, connector = await TestMigration().secret_only_then_certificate(cloud, tenant, db, checkpoints)
+        wrong = resync_links_made_without_sharing_changes(cloud, feed)
+
+        await connector.run_sync()
+        await connector.run_sync()
+
+        assert wrong == []
+        assert [r.headers.get("Prefer") for r in cloud.calls("GET", DELTA_PATH)][-1] == "deltashowsharingchanges"
+        assert permission_state(checkpoints)["mode"] == "inheritance"
+
+    async def test_a_first_sync_with_a_certificate_makes_its_link_with_sharing_changes(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
+        inheritance_drive(tenant)
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
+        await (await certificate_connector(db, checkpoints)).run_sync()
+
+        assert drive_checkpoint(checkpoints)["sharingChanges"] is True
+        assert {r.headers.get("Prefer") for r in cloud.calls("GET", DELTA_PATH)} == {"deltashowsharingchanges"}
+
+    async def test_removing_the_certificate_keeps_asking_the_link_as_it_was_made(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
+        feed = inheritance_drive(tenant)
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
+        await (await certificate_connector(db, checkpoints)).run_sync()
+        feed.by_token["D1"] = page([], delta_link=delta_link("u-ana", "D2"))
+
+        await (await ready_connector(db, checkpoints)).run_sync()
+
+        assert cloud.calls("GET", DELTA_PATH)[-1].headers.get("Prefer") == "deltashowsharingchanges"
