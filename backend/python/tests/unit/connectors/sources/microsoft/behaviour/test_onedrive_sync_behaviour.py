@@ -53,6 +53,7 @@ from app.connectors.sources.microsoft.common.msgraph_client import MSGraphClient
 from app.connectors.sources.microsoft.onedrive.connector import (
     MAX_PAGE_ATTEMPTS,
     OneDriveConnector,
+    _drive_permissions_key,
     certificate_pem,
     certificate_problem,
 )
@@ -2379,3 +2380,140 @@ class TestCertificateSuggestion:
         await connector.run_sync()
 
         assert SUGGESTION not in notification_titles(await notes(connector))
+
+
+class TestReviewFindings:
+    """Paths an independent review found could lose an answer or keep a stale inherit edge."""
+
+    async def test_with_a_certificate_delta_reports_sharing_only_changes(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
+        inheritance_drive(tenant)
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
+        await (await certificate_connector(db, checkpoints)).run_sync()
+
+        assert {r.headers.get("Prefer") for r in cloud.calls("GET", DELTA_PATH)} == {"deltashowsharingchanges"}, (
+            "an item that breaks inheritance changes only its sharing; unreported, it keeps its folder's audience"
+        )
+
+    async def test_without_a_certificate_delta_is_asked_as_before(self, cloud, tenant, db, checkpoints) -> None:
+        inheritance_drive(tenant)
+        await (await ready_connector(db, checkpoints)).run_sync()
+
+        assert {r.headers.get("Prefer") for r in cloud.calls("GET", DELTA_PATH)} == {None}
+
+    async def test_full_read_answers_of_a_pass_that_failed_are_queued(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
+        feed = reordered_drive(tenant)
+        feed.by_token[None] = page(feed.by_token[None]["value"], next_link=delta_link("u-ana", "P2"))
+        feed.by_token["P2"] = graph_error(400, "invalidRequest", "page unavailable")
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
+        connector = await certificate_connector(db, checkpoints)
+
+        with pytest.raises(ODataError):
+            await connector._run_sync_with_yield("u-ana")
+
+        assert db.inherit_edges["f1"] is True
+        assert "f1" in permission_state(checkpoints)["recheck"], "its answer was never checked against a second read"
+
+    async def test_marking_the_drive_keeps_items_queued_while_the_run_went_on(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
+        _, connector = await TestMigration().secret_only_then_certificate(cloud, tenant, db, checkpoints)
+        verify = connector._verify_scanned_inheritance
+
+        async def reindex_queues_an_item_meanwhile(drive_id: str) -> None:
+            await connector.drive_delta_sync_point.update_sync_point(_drive_permissions_key(DRIVE), {"recheck": ["queued-by-reindex"]})
+            await verify(drive_id)
+
+        connector._verify_scanned_inheritance = reindex_queues_an_item_meanwhile
+        await connector.run_sync()
+
+        assert permission_state(checkpoints)["mode"] == "inheritance"
+        assert permission_state(checkpoints)["recheck"] == ["queued-by-reindex"]
+
+    async def test_an_item_that_failed_during_the_rewrite_is_queued(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
+        _, connector = await TestMigration().secret_only_then_certificate(cloud, tenant, db, checkpoints)
+        inherits = connector._inherits_parent_access
+
+        async def fails_for_f1(item: object) -> bool | None:
+            if getattr(item, "id", None) == "f1":
+                raise RuntimeError("database unavailable")
+            return await inherits(item)
+
+        connector._inherits_parent_access = fails_for_f1
+        await connector.run_sync()
+
+        assert permission_state(checkpoints)["mode"] == "inheritance"
+        assert permission_state(checkpoints)["recheck"] == ["f1"], "it still carries the copy written before the certificate"
+
+    async def test_a_hidden_unique_item_is_read_again_next_run(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
+        feed = inheritance_drive(tenant)
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
+        connector = await certificate_connector(db, checkpoints)
+        await connector.run_sync()
+        feed.by_token["D1"] = page([changed("f1", "plan.pdf", INHERITING_UNIQUE_ID, 2, parent="d1")], delta_link=delta_link("u-ana", "D2"))
+        feed.by_token["D2"] = page([], delta_link=delta_link("u-ana", "D3"))
+        cloud.on("GET", item_lookup_path(INHERITING_UNIQUE_ID), {"d": {"Id": 3, "HasUniqueRoleAssignments": True}})
+        tenant.share("f1", graph_error(403, "accessDenied"))
+        await connector.run_sync()
+        assert db.inherit_edges["f1"] is False and db.record_permissions["f1"] == []
+        assert drive_checkpoint(checkpoints)["pendingAccessReads"] == ["f1"]
+
+        tenant.share("f1", [user_grant("u-ana", "ana@acme.com", "owner"), user_grant("u-dee", "dee@acme.com")])
+        await connector.run_sync()
+
+        assert (EntityType.USER, "u-dee", "dee@acme.com", PermissionType.READ) in perms(db, "f1")
+        assert db.inherit_edges["f1"] is False
+
+    async def test_progress_through_a_long_rewrite_resets_its_failure_count(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
+        feed, connector = await TestMigration().secret_only_then_certificate(cloud, tenant, db, checkpoints)
+        root, d1, f1, f2 = feed.by_token[None]["value"]
+        feed.by_token[None] = page([root, d1], next_link=delta_link("u-ana", "M2"))
+        feed.by_token["M2"] = [graph_error(400, "invalidRequest", "page unavailable"), page([f1], next_link=delta_link("u-ana", "M3"))]
+        feed.by_token["M3"] = graph_error(400, "invalidRequest", "page unavailable")
+        await connector.run_sync()
+        assert permission_state(checkpoints)["migrationFailures"] == 1
+
+        await connector.run_sync()
+
+        assert permission_state(checkpoints)["migrationFailures"] == 1, (
+            "M2 committed before M3 failed: failures spread over a long rewrite don't add up to a restart"
+        )
+
+    async def test_a_network_error_signing_in_to_sharepoint_is_not_a_refused_certificate(
+        self, cloud, tenant, db, checkpoints, sharepoint_rest, monkeypatch
+    ) -> None:
+        inheritance_drive(tenant)
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
+        connector = await certificate_connector(db, checkpoints)
+
+        async def unreachable(_resource: str) -> object:
+            raise ServiceRequestError("connection reset")
+
+        connector.scope_reader._get_token = unreachable
+        await connector.run_sync()
+
+        assert connector._sharepoint_refusal is None
+        assert INHERITANCE_WARNING not in notification_titles(await notes(connector))
+        assert db.inherit_edges["f1"] is False
+
+    async def test_an_unreadable_permission_state_does_not_stop_the_sync(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
+        inheritance_drive(tenant)
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
+        connector = await certificate_connector(db, checkpoints)
+        read = checkpoints.get_sync_point
+
+        async def failing_for_permissions(key: str, raise_on_error: bool = False) -> dict[str, Any] | None:
+            if "drivePermissions" in key:
+                raise RuntimeError("database unavailable")
+            return await read(key, raise_on_error)
+
+        checkpoints.get_sync_point = failing_for_permissions
+        await connector.run_sync()
+
+        assert {"root-ana", "d1", "f1", "f2"} <= set(db.records)
+
+    async def test_a_rejected_certificate_beside_a_secret_says_how_to_save_without_it(self, cloud, sharepoint_rest) -> None:
+        failing_certificate_sign_in(cloud)
+
+        result = await OneDriveConnector.check_connection(
+            TestConnectionCheck.auth(certificate=CERTIFICATE, privateKey=PRIVATE_KEY), logging.getLogger("test")
+        )
+
+        assert result.success is False and "remove the certificate and key" in result.message

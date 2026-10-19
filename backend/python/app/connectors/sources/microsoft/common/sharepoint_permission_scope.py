@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 
 import httpx
 from aiolimiter import AsyncLimiter
+from azure.core.exceptions import ClientAuthenticationError
 
 GUID_PATTERN = re.compile(r'([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})')
 
@@ -148,8 +149,11 @@ class SharePointPermissionScopeReader:
         if cached is None or cached.expires_on - TOKEN_RENEWAL_MARGIN_S <= time.time():
             try:
                 cached = await self._get_token(resource)
-            except Exception as error:
+            except ClientAuthenticationError as error:
                 raise SharePointAccessError(f"could not sign in to {resource}: {error}") from error
+            except Exception as error:
+                # Not an answer from Microsoft Entra ID (the network, say): this list only.
+                raise SharePointRestError(f"could not get a token for {resource}: {error}") from error
             self._tokens[resource] = cached
         return cached.token
 

@@ -180,6 +180,8 @@ class _FolderWalk:
     unread_items: list[str] = field(default_factory=list)
     unlisted_folders: list[str] = field(default_factory=list)
     temporary: bool = False
+    # Unique items whose inherit edge was dropped because their access couldn't be read.
+    hidden_items: list[str] = field(default_factory=list[str])
 
     @property
     def complete(self) -> bool:
@@ -202,6 +204,8 @@ class _DeltaCursor:
     delta_field: str | None
     # The sync point as read at the start of the run.
     state: dict[str, Any]
+    # Written with each page that commits.
+    on_progress: dict[str, Any] = field(default_factory=dict[str, Any])
 
     def held_attempts(self, url: str) -> int:
         """Runs that already failed on this page, when it is the page the pass is held at."""
@@ -511,6 +515,11 @@ class OneDriveConnector(BaseConnector):
         self.msgraph_client: MSGraphClient | None = None
         self.scope_reader: SharePointPermissionScopeReader | None = None
         self._user_drive_ids: dict[str, str] = {}
+        # Per drive, items written without knowing whether they inherit, until saved to be read again.
+        # Kept across a run reset: a reindex running beside the sync may still be filling them.
+        self._items_without_known_inheritance: dict[str, set[str]] = {}
+        # Per drive, UniqueId -> item id of items written as inheriting on a full read's answer.
+        self._inheriting_from_full_read: dict[str, dict[str, str]] = {}
         self._reset_permission_scopes()
 
     async def init(self) -> bool:
@@ -590,10 +599,6 @@ class OneDriveConnector(BaseConnector):
         # Set once SharePoint refuses the app itself; no list is asked again this run.
         self._sharepoint_refusal: str | None = None
         self._unreadable_drives_logged: set[str] = set()
-        # Per drive, items written this run without knowing whether they inherit.
-        self._items_without_known_inheritance: dict[str, set[str]] = {}
-        # Per drive, UniqueId -> item id of items written as inheriting on a full read's answer.
-        self._inheriting_from_full_read: dict[str, dict[str, str]] = {}
 
     async def _get_drive_scope(self, drive_id: str) -> ListUniquePermissions | None:
         """Which items of a drive carry their own permissions; None when that can't be read."""
@@ -936,6 +941,8 @@ class OneDriveConnector(BaseConnector):
                 if existing_record:
                     metadata_changed = True
                     is_updated = True
+                    if unresolved_access is not None and item.id:
+                        unresolved_access.append(item.id)
             else:
                 file_record.inherit_permissions = await self.data_entities_processor.inheritance_when_unreadable(
                     CollectionNames.RECORDS.value, existing_record.id if existing_record else None
@@ -955,6 +962,8 @@ class OneDriveConnector(BaseConnector):
                     )
                     if walk.temporary and hold_page_on_incomplete_walk:
                         raise DrivePageIncompleteError(f"access of some items inside folder {item.id} could not be read")
+                    if unresolved_access is not None:
+                        unresolved_access.extend(walk.hidden_items)
                     if permission_failure:
                         unresolved = [item.id, *walk.unread_items]
                         for unlisted_folder in walk.unlisted_folders:
@@ -985,6 +994,8 @@ class OneDriveConnector(BaseConnector):
             raise
         except Exception as ex:
             self.logger.error(f"❌ Error processing delta item {item.id}: {ex}", exc_info=True)
+            # Whatever access it has stored is read again, so a rewrite of the drive can't skip it.
+            self._queue_unknown_inheritance(item.parent_reference.drive_id if item.parent_reference else None, item.id)
             return None
 
     async def _convert_to_permissions(self, msgraph_permissions: List) -> List[Permission]:
@@ -1274,6 +1285,8 @@ class OneDriveConnector(BaseConnector):
                     # new sharing on to it; dropped, its stored grants alone stand until it can be read.
                     existing_child_record.inherit_permissions = False
                     await self.data_entities_processor.on_record_metadata_update(existing_child_record)
+                    if child.id:
+                        walk.hidden_items.append(child.id)
 
                 if child_permissions is not None and existing_child_record:
                     converted_permissions = await self._convert_to_permissions(child_permissions)
@@ -1308,20 +1321,23 @@ class OneDriveConnector(BaseConnector):
         are given the folder's current access instead. That drops any sharing of
         their own too, until the item changes or is reindexed.
         """
-        if not unshared:
-            self.logger.error(
-                f"❌ Folder {folder_id} was shared, but the access of {walk.unread_items + walk.unlisted_folders} "
-                "could not be read; they keep their stored access. Reindex them to pick up the new sharing."
-            )
-            return
-
-        records = []
+        records: list[Record] = []
         for external_id in walk.unread_items:
             record = await self.data_entities_processor.get_record_by_external_id(self.connector_id, external_id)
             if record:
                 records.append(record)
         for unlisted_folder in walk.unlisted_folders:
             records.extend(await self._stored_descendants(unlisted_folder))
+        # Whether these inherit wasn't read either; asked again, so none keeps an access it shouldn't.
+        for record in records:
+            self._queue_unknown_inheritance(record.external_record_group_id, record.external_record_id)
+
+        if not unshared:
+            self.logger.error(
+                f"❌ Folder {folder_id} was shared, but the access of {walk.unread_items + walk.unlisted_folders} "
+                "could not be read; they keep their stored access. Reindex them to pick up the new sharing."
+            )
+            return
 
         for record in records:
             record.inherit_permissions = False
@@ -1387,6 +1403,10 @@ class OneDriveConnector(BaseConnector):
 
         except Exception as e:
             self.logger.error(f"❌ Error handling record updates: {e}", exc_info=True)
+            if record_update.record is not None:
+                self._queue_unknown_inheritance(
+                    record_update.record.external_record_group_id, record_update.record.external_record_id
+                )
 
     async def _sync_user_groups(self) -> None:
         """
@@ -1952,18 +1972,26 @@ class OneDriveConnector(BaseConnector):
                 url = ("{+baseurl}" + root_url)
 
             drive_id = await self._user_drive_id(user_id)
-            permission_key = _drive_permissions_key(drive_id) if drive_id else None
             permission_state: dict[str, Any] = {}
-            if permission_key:
-                permission_state = await self.drive_delta_sync_point.read_sync_point(permission_key) or {}
-                if enumerates_drive and self.scope_reader is not None:
-                    # A first sync reads every item, so with a certificate it leaves the drive in inheritance mode.
-                    permission_state["enumerating"] = True
-                    await self.drive_delta_sync_point.update_sync_point(permission_key, {"enumerating": True})
+            if drive_id:
+                try:
+                    permission_key = _drive_permissions_key(drive_id)
+                    permission_state = await self.drive_delta_sync_point.read_sync_point(permission_key) or {}
+                    if enumerates_drive and self.scope_reader is not None:
+                        # A first sync reads every item, so with a certificate it leaves the drive in inheritance mode.
+                        permission_state["enumerating"] = True
+                        await self.drive_delta_sync_point.update_sync_point(permission_key, {"enumerating": True})
+                except Exception as e:
+                    # The drive still syncs; how its records were written is brought up to date on a later run.
+                    self.logger.warning(f"⚠️ Could not read how user {user_id}'s OneDrive records were written: {e}")
+                    drive_id = None
 
             try:
                 if drive_id and permission_state.get("recheck") and self.scope_reader is not None:
-                    await self._recheck_item_access(drive_id, permission_state)
+                    try:
+                        await self._recheck_item_access(drive_id, permission_state)
+                    except Exception as e:
+                        self.logger.warning(f"⚠️ Could not read again the access of queued items of OneDrive {drive_id}: {e}")
 
                 pending_access = await self._sync_delta_pages(
                     user_id,
@@ -1977,6 +2005,8 @@ class OneDriveConnector(BaseConnector):
                         state=sync_point or {},
                     ),
                     pending_access,
+                    show_sharing_changes=self.scope_reader is not None
+                    or permission_state.get("mode") == PERMISSION_MODE_INHERITANCE,
                 )
 
                 if drive_id:
@@ -1984,8 +2014,11 @@ class OneDriveConnector(BaseConnector):
                     await self._settle_permission_mode(user_id, drive_id, permission_state, pending_access)
             finally:
                 if drive_id:
-                    await self._save_items_without_known_inheritance(drive_id, permission_state)
                     self._forget_drive_scope(drive_id)
+                    try:
+                        await self._save_items_without_known_inheritance(drive_id)
+                    except Exception as e:
+                        self.logger.error(f"❌ Could not queue items of OneDrive {drive_id} to be read again: {e}")
 
             self.logger.info(f"Completed delta sync for user {user_id}")
 
@@ -1994,7 +2027,7 @@ class OneDriveConnector(BaseConnector):
             raise
 
     async def _sync_delta_pages(
-        self, user_id: str, url: str, cursor: "_DeltaCursor", pending_access: list[str]
+        self, user_id: str, url: str, cursor: "_DeltaCursor", pending_access: list[str], *, show_sharing_changes: bool = False
     ) -> list[str]:
         """Read a drive's delta pages from ``url`` and apply them; returns the items whose access is still to be read."""
         sync_point_key = generate_record_sync_point_key(RecordType.DRIVE.value, "users", user_id)
@@ -2003,7 +2036,9 @@ class OneDriveConnector(BaseConnector):
 
         while True:
             # Fetch delta changes
-            result = await self.msgraph_client.get_delta_response(url)
+            # An item that breaks inheritance changes only its sharing. While items are stored as
+            # inheriting, delta must report that, or the item keeps its folder's audience.
+            result = await self.msgraph_client.get_delta_response(url, show_sharing_changes=show_sharing_changes)
             # Graph can send an empty page with a nextLink, and the last page of a
             # no-change sync is empty too; both links still have to be followed or saved.
             drive_items = result.get('drive_items') or []
@@ -2074,6 +2109,7 @@ class OneDriveConnector(BaseConnector):
                         cursor.next_field: next_link,
                         cursor.held_field: None,
                         cursor.held_attempts_field: 0,
+                        **cursor.on_progress,
                         **({"pendingAccessReads": pending_access} if cursor.key == sync_point_key else {}),
                     }
                 )
@@ -2164,11 +2200,15 @@ class OneDriveConnector(BaseConnector):
                     held_attempts_field="migrationHeldPageAttempts",
                     delta_field=None,
                     state=permission_state,
+                    # Restarting from scratch is for a cursor that stopped working, not for failures spread over a long rewrite.
+                    on_progress={"migrationFailures": 0},
                 ),
                 pending_access,
+                show_sharing_changes=True,
             )
         except Exception as e:
-            failures = int(permission_state.get("migrationFailures") or 0) + 1
+            stored = await self.drive_delta_sync_point.read_sync_point(permission_key) or {}
+            failures = int(stored.get("migrationFailures") or 0) + 1
             restart = failures >= MAX_PAGE_ATTEMPTS
             self.logger.error(
                 f"❌ Rewriting the stored access of user {user_id}'s OneDrive stopped; it "
@@ -2186,7 +2226,9 @@ class OneDriveConnector(BaseConnector):
 
     async def _mark_inheritance_mode(self, drive_id: str, permission_state: dict[str, Any]) -> None:
         unknown = self._items_without_known_inheritance.get(drive_id, set())
-        recheck = set(permission_state.get("recheck") or []) | unknown
+        # Read again rather than taken from the start of the run: a reindex may have queued items since.
+        stored = await self.drive_delta_sync_point.read_sync_point(_drive_permissions_key(drive_id)) or {}
+        recheck = set(stored.get("recheck") or []) | unknown
         update: dict[str, Any] = {"enumerating": False, "migrationNextLink": None, "migrationFailures": 0}
         if len(recheck) <= MAX_RECHECK_ITEMS:
             update.update({"mode": PERMISSION_MODE_INHERITANCE, "recheck": sorted(recheck)})
@@ -2198,8 +2240,8 @@ class OneDriveConnector(BaseConnector):
         if update["mode"] == PERMISSION_MODE_INHERITANCE:
             self.logger.info(f"✅ OneDrive {drive_id}: items now inherit their folder's access")
 
-    async def _save_items_without_known_inheritance(self, drive_id: str, permission_state: dict[str, Any]) -> None:
-        """Queue the items written this run without knowing whether they inherit, to be read again.
+    async def _save_items_without_known_inheritance(self, drive_id: str) -> None:
+        """Queue the items written without knowing whether they inherit, to be read again.
 
         Only for a drive in (or moving to) inheritance mode: elsewhere every record
         carries its effective access anyway. Too many to queue, and the drive falls
@@ -2208,10 +2250,11 @@ class OneDriveConnector(BaseConnector):
         unknown = self._items_without_known_inheritance.pop(drive_id, None)
         if not unknown:
             return
-        in_inheritance = permission_state.get("mode") == PERMISSION_MODE_INHERITANCE
-        if not (in_inheritance or permission_state.get("enumerating")):
+        key = _drive_permissions_key(drive_id)
+        state = await self.drive_delta_sync_point.read_sync_point(key) or {}
+        if not (state.get("mode") == PERMISSION_MODE_INHERITANCE or state.get("enumerating")):
             return
-        recheck = set(permission_state.get("recheck") or []) | unknown
+        recheck = set(state.get("recheck") or []) | unknown
         if len(recheck) <= MAX_RECHECK_ITEMS:
             update: dict[str, Any] = {"recheck": sorted(recheck)}
         else:
@@ -2220,14 +2263,18 @@ class OneDriveConnector(BaseConnector):
                 "the drive is rewritten in full once SharePoint can be read again."
             )
             update = {"mode": PERMISSION_MODE_ITEM_ACL, "recheck": [], "enumerating": False, "migrationNextLink": None}
-        await self.drive_delta_sync_point.update_sync_point(_drive_permissions_key(drive_id), update)
-        permission_state.update(update)
+        await self.drive_delta_sync_point.update_sync_point(key, update)
 
     async def _recheck_item_access(self, drive_id: str, permission_state: dict[str, Any]) -> None:
         """Rewrite the access of items queued because it wasn't known whether they inherit."""
-        remaining = await self._reevaluate_item_access(drive_id, list(permission_state.get("recheck") or []))
-        await self.drive_delta_sync_point.update_sync_point(_drive_permissions_key(drive_id), {"recheck": remaining})
-        permission_state["recheck"] = remaining
+        queued = list(permission_state.get("recheck") or [])
+        remaining = await self._reevaluate_item_access(drive_id, queued)
+        key = _drive_permissions_key(drive_id)
+        # Items queued by a reindex while these were read stay queued.
+        stored = await self.drive_delta_sync_point.read_sync_point(key) or {}
+        recheck = sorted((set(stored.get("recheck") or []) - set(queued)) | set(remaining))
+        await self.drive_delta_sync_point.update_sync_point(key, {"recheck": recheck})
+        permission_state["recheck"] = recheck
 
     async def _reevaluate_item_access(self, drive_id: str, item_ids: list[str]) -> list[str]:
         """Read again whether stored items inherit, and rewrite their access; returns those still unknown."""
@@ -2269,8 +2316,13 @@ class OneDriveConnector(BaseConnector):
         between would otherwise keep its folder's access until it next changes.
         """
         decided = self._inheriting_from_full_read.pop(drive_id, {})
+        if not decided:
+            return
         scope = self._drive_scopes.get(drive_id)
-        if not decided or scope is None:
+        if scope is None:
+            # SharePoint stopped answering after the full read: those answers are checked next run.
+            for item_id in decided.values():
+                self._queue_unknown_inheritance(drive_id, item_id)
             return
         try:
             changed = await scope.changed_to_unique_since_read(set(decided))
@@ -2279,19 +2331,27 @@ class OneDriveConnector(BaseConnector):
                 f"⚠️ Could not check OneDrive {drive_id} again for items that broke inheritance during this run; "
                 f"they are read one by one: {e}"
             )
-            self._items_without_known_inheritance.setdefault(drive_id, set()).update(decided.values())
+            for item_id in decided.values():
+                self._queue_unknown_inheritance(drive_id, item_id)
             return
         if not changed:
             return
         # Asked one by one from here: the full read is what went stale.
         self._drive_scopes.pop(drive_id, None)
-        remaining = await self._reevaluate_item_access(drive_id, [decided[unique_id] for unique_id in changed])
-        if remaining:
-            self._items_without_known_inheritance.setdefault(drive_id, set()).update(remaining)
+        changed_items = [decided[unique_id] for unique_id in changed]
+        try:
+            remaining = await self._reevaluate_item_access(drive_id, changed_items)
+        except Exception as e:
+            self.logger.warning(f"⚠️ Could not rewrite items of OneDrive {drive_id} that broke inheritance; queued: {e}")
+            remaining = changed_items
+        for item_id in remaining:
+            self._queue_unknown_inheritance(drive_id, item_id)
 
     def _forget_drive_scope(self, drive_id: str) -> None:
+        """Drop what SharePoint said about a drive; full-read answers not yet checked are queued instead."""
         self._drive_scopes.pop(drive_id, None)
-        self._inheriting_from_full_read.pop(drive_id, None)
+        for item_id in self._inheriting_from_full_read.pop(drive_id, {}).values():
+            self._queue_unknown_inheritance(drive_id, item_id)
 
     async def _retry_pending_access_reads(self, pending: list[str], sync_point_key: str) -> list[str]:
         """Read again the access of items saved while it couldn't be read; returns those still unread."""
@@ -2765,10 +2825,8 @@ class OneDriveConnector(BaseConnector):
         for drive_id in drive_ids:
             if not drive_id:
                 continue
-            if drive_id in self._items_without_known_inheritance:
-                state = await self.drive_delta_sync_point.read_sync_point(_drive_permissions_key(drive_id)) or {}
-                await self._save_items_without_known_inheritance(drive_id, state)
             self._forget_drive_scope(drive_id)
+            await self._save_items_without_known_inheritance(drive_id)
 
     async def reindex_records(self, records: List[Record]) -> None:
         """Reindex records."""
@@ -2942,19 +3000,28 @@ class OneDriveConnector(BaseConnector):
                 certificate_data=certificate_pem(auth_config),
             )))
 
-        for kind, credential in credentials:
-            try:
-                async with credential:
+        try:
+            for kind, credential in credentials:
+                try:
                     await credential.get_token("https://graph.microsoft.com/.default")
-            except ClientAuthenticationError as e:
-                reason = sanitize_azure_error(e).splitlines()[0]
-                logger.info("OneDrive connection check: the %s was rejected: %s", kind, reason)
-                return ConnectionCheckResult(success=False, message=_sign_in_rejection(kind, reason))
-            except Exception as e:
-                logger.warning("OneDrive connection check could not sign in with the %s: %r", kind, e)
-                return ConnectionCheckResult(
-                    success=True, message=f"Saved without checking the {kind}: Microsoft Entra ID could not be reached."
-                )
+                except ClientAuthenticationError as e:
+                    reason = (sanitize_azure_error(e).splitlines() or ["no reason given"])[0]
+                    logger.info("OneDrive connection check: the %s was rejected: %s", kind, reason)
+                    message = _sign_in_rejection(kind, reason)
+                    if kind == "client certificate" and auth_config.get("clientSecret"):
+                        message = f"{message} Or remove the certificate and key to sign in with the client secret only."
+                    return ConnectionCheckResult(success=False, message=message)
+                except Exception as e:
+                    logger.warning("OneDrive connection check could not sign in with the %s: %r", kind, e)
+                    return ConnectionCheckResult(
+                        success=True, message=f"Saved without checking the {kind}: Microsoft Entra ID could not be reached."
+                    )
+        finally:
+            for _, credential in credentials:
+                try:
+                    await credential.close()
+                except Exception:
+                    logger.debug("A connection-check credential did not close cleanly", exc_info=True)
 
         if with_certificate:
             return ConnectionCheckResult(
