@@ -8,7 +8,9 @@ answered by an in-memory stub, and our databases are in-memory fakes.
 
 import base64
 import logging
+import re
 import sys
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, Optional
 from unittest.mock import MagicMock
@@ -16,6 +18,10 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 from azure.identity.aio import ClientSecretCredential
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
 from fastapi import HTTPException
 from ms_graph_fakes import (
     GRAPH,
@@ -1382,8 +1388,25 @@ class TestReindexAndDownload:
         assert backoff_sleeps.count(2) == 3, "the SDK waited as asked before each of its three retries"
 
 
-CERTIFICATE = "-----BEGIN CERTIFICATE-----\nMIIcert\n-----END CERTIFICATE-----"
-PRIVATE_KEY = "-----BEGIN PRIVATE KEY-----\nMIIkey\n-----END PRIVATE KEY-----"
+def self_signed_certificate(*, valid_days: int = 365, start_days_ago: int = 1) -> tuple[str, str]:
+    """A certificate and its PKCS#8 private key, as an admin would upload them."""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "pipeshub-onedrive-test")])
+    start = datetime.now(timezone.utc) - timedelta(days=start_days_ago)
+    certificate = (
+        x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+        .serial_number(x509.random_serial_number()).not_valid_before(start)
+        .not_valid_after(start + timedelta(days=valid_days)).sign(key, hashes.SHA256())
+    )
+    return (
+        certificate.public_bytes(serialization.Encoding.PEM).decode().strip(),
+        key.private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+        ).decode().strip(),
+    )
+
+
+CERTIFICATE, PRIVATE_KEY = self_signed_certificate()
 SCOPE_MODULE = "app.connectors.sources.microsoft.common.sharepoint_permission_scope"
 LIST_ID = "6f1c2a8e-0b3d-4c5e-9f7a-1b2c3d4e5f60"
 PERSONAL_SITE = "https://acme-my.sharepoint.com/personal/ana_acme_com"
@@ -1428,13 +1451,36 @@ def sharepoint_rest(cloud: MicrosoftCloudStub, monkeypatch: pytest.MonkeyPatch) 
     return certificate_sign_ins
 
 
-def serve_unique_items(cloud: MicrosoftCloudStub, *unique_ids: str) -> None:
-    """The drive's list on SharePoint REST; the given items have broken inheritance."""
+def serve_unique_items(cloud: MicrosoftCloudStub, *unique_ids: str, inheriting: tuple[str, ...] = ()) -> None:
+    """The drive's list on SharePoint REST: the given items broke inheritance, ``inheriting`` didn't.
+
+    Answered the three ways the connector asks: the list itself (its size), every
+    item at once, and one item by its UniqueId; an item in neither is unknown (400).
+    """
+    flags = {unique_id: True for unique_id in unique_ids} | {unique_id: False for unique_id in inheriting}
     cloud.on("GET", f"/v1.0/drives/{DRIVE}", {"id": DRIVE, "sharePointIds": {"listId": LIST_ID, "siteUrl": PERSONAL_SITE}})
-    cloud.on("GET", LIST_REST, {"d": {"Id": LIST_ID, "HasUniqueRoleAssignments": False}})
+    cloud.on("GET", LIST_REST, {"d": {"Id": LIST_ID, "ItemCount": len(flags), "HasUniqueRoleAssignments": False}})
     cloud.on("GET", f"{LIST_REST}/items", {"d": {"results": [
-        {"Id": n, "UniqueId": unique_id, "HasUniqueRoleAssignments": True} for n, unique_id in enumerate(unique_ids, 1)
+        {"Id": n, "UniqueId": unique_id, "HasUniqueRoleAssignments": flag} for n, (unique_id, flag) in enumerate(flags.items(), 1)
     ]}})
+    for n, (unique_id, flag) in enumerate(flags.items(), 1):
+        cloud.on("GET", item_lookup_path(unique_id), {"d": {"Id": n, "HasUniqueRoleAssignments": flag}})
+
+
+def item_lookup_path(unique_id: str) -> str:
+    return f"{LIST_REST}/GetItemByUniqueId(guid'{unique_id}')"
+
+
+def sharepoint_calls(cloud: MicrosoftCloudStub) -> list[str]:
+    """SharePoint REST requests, by kind: "list", "items" or "item <UniqueId>"."""
+    kinds = []
+    for request in cloud.requests:
+        if request.url.host != "acme-my.sharepoint.com":
+            continue
+        path = MicrosoftCloudStub.path_of(request)
+        lookup = re.search(r"GetItemByUniqueId\(guid'([^']+)'\)", path)
+        kinds.append(f"item {lookup.group(1)}" if lookup else "items" if path.endswith("/items") else "list")
+    return kinds
 
 
 async def certificate_connector(db: FakeRecordsDb, checkpoints: FakeCheckpointStore) -> OneDriveConnector:
@@ -1473,7 +1519,7 @@ class TestInheritedAccess:
         self, cloud, tenant, db, checkpoints, sharepoint_rest
     ) -> None:
         inheritance_drive(tenant)
-        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID)
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
         connector = await certificate_connector(db, checkpoints)
 
         await connector.run_sync()
@@ -1495,7 +1541,7 @@ class TestInheritedAccess:
         self, cloud, tenant, db, checkpoints, sharepoint_rest
     ) -> None:
         inheritance_drive(tenant)
-        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID)
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
         connector = await certificate_connector(db, checkpoints)
 
         await connector.run_sync()
@@ -1505,14 +1551,15 @@ class TestInheritedAccess:
         )
         scopes = {form["scope"] for form in cloud.token_requests()}
         assert "https://acme-my.sharepoint.com/.default" in scopes
-        rest_calls = [r for r in cloud.requests if r.url.host == "acme-my.sharepoint.com"]
-        assert len(rest_calls) == 2, "the list and its items are read once for the whole drive"
+        assert sharepoint_calls(cloud) == [
+            "list", f"item {FOLDER_UNIQUE_ID}", f"item {INHERITING_UNIQUE_ID}", "list", "items",
+        ], "two lookups cost as much as reading the 3-item list, so the third item is answered by one full read"
 
     async def test_unreadable_unique_permissions_leave_every_item_its_own_access(
         self, cloud, tenant, db, checkpoints, sharepoint_rest
     ) -> None:
         inheritance_drive(tenant)
-        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID)
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
         cloud.on("GET", LIST_REST, json_response({"error": "Unsupported app only token."}, status=401))
         connector = await certificate_connector(db, checkpoints)
 
@@ -1528,7 +1575,7 @@ class TestInheritedAccess:
 
     async def test_without_a_certificate_sharepoint_is_never_called(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
         inheritance_drive(tenant)
-        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID)
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
         connector = await ready_connector(db, checkpoints)
 
         await connector.run_sync()
@@ -1542,7 +1589,7 @@ class TestInheritedAccess:
         self, cloud, tenant, db, checkpoints, sharepoint_rest
     ) -> None:
         feed = inheritance_drive(tenant)
-        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID)
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
         connector = await certificate_connector(db, checkpoints)
         await connector.run_sync()
         feed.by_token["D1"] = page(
@@ -1581,7 +1628,7 @@ class TestInheritedAccess:
         tenant.share("d1", [user_grant("u-ana", "ana@acme.com", "owner"), user_grant("u-ben", "ben@acme.com")])
         cloud.on("GET", f"/v1.0/drives/{DRIVE}/items/d1/children",
                  page([drive_item("f1", "plan.pdf", parent="d1", etag=guid_etag(INHERITING_UNIQUE_ID))]))
-        serve_unique_items(cloud, FOLDER_UNIQUE_ID)
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
         connector = await certificate_connector(db, checkpoints)
 
         await connector.run_sync()
