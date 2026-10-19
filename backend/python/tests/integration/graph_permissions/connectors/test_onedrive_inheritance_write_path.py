@@ -12,7 +12,13 @@ import uuid
 import pytest
 
 from app.config.constants.arangodb import Connectors, OriginTypes
-from app.models.entities import AppUser, FileRecord, RecordGroup, RecordGroupType, RecordType
+from app.models.entities import (
+    AppUser,
+    FileRecord,
+    RecordGroup,
+    RecordGroupType,
+    RecordType,
+)
 from app.models.permission import EntityType, Permission, PermissionType
 
 from ..processor_harness import build_processor

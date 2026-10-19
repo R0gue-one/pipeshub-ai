@@ -2102,11 +2102,13 @@ class OneDriveConnector(BaseConnector):
         record knowing whether it inherits.
         """
         permission_key = _drive_permissions_key(drive_id)
-        if permission_state.get("enumerating"):
-            # The enumeration that just finished read every item; those it couldn't tell are queued for recheck.
+        if permission_state.get("enumerating") and not permission_state.get("migrationNextLink"):
+            # A first sync just read every item; those it couldn't tell are queued for recheck.
             await self._mark_inheritance_mode(drive_id, permission_state)
             return
-        if self.scope_reader is None or permission_state.get("mode") == PERMISSION_MODE_INHERITANCE:
+        if self.scope_reader is None or (
+            permission_state.get("mode") == PERMISSION_MODE_INHERITANCE and not permission_state.get("migrationNextLink")
+        ):
             return
         if await self._get_drive_scope(drive_id) is None:
             return
@@ -2141,10 +2143,12 @@ class OneDriveConnector(BaseConnector):
                 f"❌ Rewriting the stored access of user {user_id}'s OneDrive stopped; it "
                 f"{'starts over' if restart else 'resumes'} next run: {e}"
             )
-            await self.drive_delta_sync_point.update_sync_point(
-                permission_key,
-                {"migrationFailures": 0, "migrationNextLink": None} if restart else {"migrationFailures": failures},
+            update: dict[str, Any] = (
+                {"migrationFailures": 0, "migrationNextLink": None, "enumerating": False}
+                if restart else {"migrationFailures": failures}
             )
+            await self.drive_delta_sync_point.update_sync_point(permission_key, update)
+            permission_state.update(update)
             return
         await self._verify_scanned_inheritance(drive_id)
         await self._mark_inheritance_mode(drive_id, permission_state)
@@ -2889,23 +2893,24 @@ class OneDriveConnector(BaseConnector):
         certificate upload that can't be used. A sign-in that can't be tried (the
         network, say) lets the save go ahead, as it did before this check existed.
         """
+        with_certificate = has_certificate_fields(auth_config)
+        problem = certificate_problem(auth_config) if with_certificate else None
+        if problem:
+            if auth_config.get("clientSecret"):
+                problem = f"{problem} Or remove the certificate and key to sign in with the client secret only."
+            return ConnectionCheckResult(success=False, message=problem)
         try:
-            credentials = [graph_credential(auth_config)]
+            graph_sign_in = graph_credential(auth_config)
         except ValueError as e:
             return ConnectionCheckResult(success=False, message=str(e).removeprefix("Incomplete OneDrive credentials. "))
-        with_certificate = has_certificate_fields(auth_config)
-        if with_certificate:
-            problem = certificate_problem(auth_config)
-            if problem:
-                return ConnectionCheckResult(success=False, message=f"{problem} Or remove the certificate and key to sign in with the client secret only.")
-            if auth_config.get("clientSecret"):
-                credentials.append(CertificateCredential(
-                    tenant_id=auth_config["tenantId"], client_id=auth_config["clientId"],
-                    certificate_data=certificate_pem(auth_config),
-                ))
+        credentials = [("client secret" if auth_config.get("clientSecret") else "client certificate", graph_sign_in)]
+        if with_certificate and auth_config.get("clientSecret"):
+            credentials.append(("client certificate", CertificateCredential(
+                tenant_id=auth_config["tenantId"], client_id=auth_config["clientId"],
+                certificate_data=certificate_pem(auth_config),
+            )))
 
-        for credential in credentials:
-            kind = "client certificate" if isinstance(credential, CertificateCredential) else "client secret"
+        for kind, credential in credentials:
             try:
                 async with credential:
                     await credential.get_token("https://graph.microsoft.com/.default")

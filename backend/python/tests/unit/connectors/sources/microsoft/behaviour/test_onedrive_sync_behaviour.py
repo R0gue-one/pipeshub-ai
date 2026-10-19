@@ -12,11 +12,13 @@ import re
 import sys
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from typing import Any, Optional
+from typing import Any
 from unittest.mock import MagicMock
+from urllib.parse import parse_qs
 
 import httpx
 import pytest
+from azure.core.exceptions import ServiceRequestError
 from azure.identity.aio import ClientSecretCredential
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -26,6 +28,7 @@ from fastapi import HTTPException
 from ms_graph_fakes import (
     GRAPH,
     TENANT,
+    TOKEN_PATH,
     FakeCheckpointStore,
     FakeConfigService,
     FakeRecordsDb,
@@ -41,12 +44,19 @@ from ms_graph_fakes import (
 from msgraph import GraphServiceClient
 from msgraph.generated.models.o_data_errors.o_data_error import ODataError
 
+from app.config.constants.arangodb import Connectors, OriginTypes
+from app.connectors.core.base.connector.connector_service import (
+    BaseConnector,
+    ConnectionCheckResult,
+)
 from app.connectors.sources.microsoft.common.msgraph_client import MSGraphClient
 from app.connectors.sources.microsoft.onedrive.connector import (
+    MAX_PAGE_ATTEMPTS,
     OneDriveConnector,
     certificate_pem,
+    certificate_problem,
 )
-from app.models.entities import RecordGroupType
+from app.models.entities import FileRecord, RecordGroupType, RecordType
 from app.models.permission import EntityType, PermissionType
 
 MODULE = "app.connectors.sources.microsoft.onedrive.connector"
@@ -75,7 +85,7 @@ def drive_item(
     drive: str = DRIVE,
     folder: bool = False,
     shared: bool = False,
-    quick_xor: Optional[str] = "hash-1",
+    quick_xor: str | None = "hash-1",
     deleted: bool = False,
 ) -> dict[str, Any]:
     item: dict[str, Any] = {
@@ -114,8 +124,8 @@ class TokenFeed:
 
     def __init__(self, param: str = "token") -> None:
         self.param = param
-        self.by_token: dict[Optional[str], Any] = {}
-        self.seen: list[Optional[str]] = []
+        self.by_token: dict[str | None, Any] = {}
+        self.seen: list[str | None] = []
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         token = MicrosoftCloudStub.query(request).get(self.param)
@@ -183,14 +193,14 @@ def tenant(cloud: MicrosoftCloudStub, db: FakeRecordsDb) -> Tenant:
     return Tenant(cloud, db)
 
 
-def onedrive_config(filters: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+def onedrive_config(filters: dict[str, Any] | None = None) -> dict[str, Any]:
     return {
         "auth": {"tenantId": TENANT, "clientId": "client-1", "clientSecret": "secret-1", "hasAdminConsent": True},
         "filters": {"sync": {"values": filters or {}}},
     }
 
 
-async def make_connector(db: FakeRecordsDb, checkpoints: FakeCheckpointStore, filters: Optional[dict] = None) -> OneDriveConnector:
+async def make_connector(db: FakeRecordsDb, checkpoints: FakeCheckpointStore, filters: dict | None = None) -> OneDriveConnector:
     connector = OneDriveConnector(
         logging.getLogger("test.onedrive"), db, checkpoints, FakeConfigService(CONNECTOR_ID, onedrive_config(filters)),
         CONNECTOR_ID, "team", "creator-1",
@@ -199,7 +209,7 @@ async def make_connector(db: FakeRecordsDb, checkpoints: FakeCheckpointStore, fi
     return connector
 
 
-async def ready_connector(db: FakeRecordsDb, checkpoints: FakeCheckpointStore, filters: Optional[dict] = None) -> OneDriveConnector:
+async def ready_connector(db: FakeRecordsDb, checkpoints: FakeCheckpointStore, filters: dict | None = None) -> OneDriveConnector:
     connector = await make_connector(db, checkpoints, filters)
     assert await connector.init() is True
     return connector
@@ -212,11 +222,11 @@ async def notes(connector: OneDriveConnector) -> list[dict[str, Any]]:
     return connector._notification_service.sent
 
 
-def drive_checkpoint(checkpoints: FakeCheckpointStore, user: str = "u-ana") -> Optional[dict[str, Any]]:
+def drive_checkpoint(checkpoints: FakeCheckpointStore, user: str = "u-ana") -> dict[str, Any] | None:
     return checkpoints.values_for(f"/users/{user}")
 
 
-def groups_checkpoint(checkpoints: FakeCheckpointStore) -> Optional[dict[str, Any]]:
+def groups_checkpoint(checkpoints: FakeCheckpointStore) -> dict[str, Any] | None:
     return checkpoints.values_for("/groups/organization/org-1")
 
 
@@ -1388,6 +1398,12 @@ class TestReindexAndDownload:
         assert backoff_sleeps.count(2) == 3, "the SDK waited as asked before each of its three retries"
 
 
+@pytest.fixture(autouse=True)
+def fresh_notification_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``notify`` backs off per message across the process; each test starts without that history."""
+    monkeypatch.setattr(BaseConnector, "_notification_cache", {})
+
+
 def self_signed_certificate(*, valid_days: int = 365, start_days_ago: int = 1) -> tuple[str, str]:
     """A certificate and its PKCS#8 private key, as an admin would upload them."""
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -1451,17 +1467,28 @@ def sharepoint_rest(cloud: MicrosoftCloudStub, monkeypatch: pytest.MonkeyPatch) 
     return certificate_sign_ins
 
 
-def serve_unique_items(cloud: MicrosoftCloudStub, *unique_ids: str, inheriting: tuple[str, ...] = ()) -> None:
+def serve_unique_items(
+    cloud: MicrosoftCloudStub,
+    *unique_ids: str,
+    inheriting: tuple[str, ...] = (),
+    unlisted: tuple[str, ...] = (),
+    item_count: int | None = None,
+) -> None:
     """The drive's list on SharePoint REST: the given items broke inheritance, ``inheriting`` didn't.
 
     Answered the three ways the connector asks: the list itself (its size), every
-    item at once, and one item by its UniqueId; an item in neither is unknown (400).
+    item at once, and one item by its UniqueId; an item in neither is unknown.
+    ``unlisted`` items are left out of the full read (added after it, say) but
+    still answer on their own.
     """
-    flags = {unique_id: True for unique_id in unique_ids} | {unique_id: False for unique_id in inheriting}
+    flags = dict.fromkeys(unique_ids, True) | dict.fromkeys(inheriting, False)
     cloud.on("GET", f"/v1.0/drives/{DRIVE}", {"id": DRIVE, "sharePointIds": {"listId": LIST_ID, "siteUrl": PERSONAL_SITE}})
-    cloud.on("GET", LIST_REST, {"d": {"Id": LIST_ID, "ItemCount": len(flags), "HasUniqueRoleAssignments": False}})
+    cloud.on("GET", LIST_REST, {"d": {
+        "Id": LIST_ID, "ItemCount": len(flags) if item_count is None else item_count, "HasUniqueRoleAssignments": False,
+    }})
     cloud.on("GET", f"{LIST_REST}/items", {"d": {"results": [
-        {"Id": n, "UniqueId": unique_id, "HasUniqueRoleAssignments": flag} for n, (unique_id, flag) in enumerate(flags.items(), 1)
+        {"Id": n, "UniqueId": unique_id, "HasUniqueRoleAssignments": flag}
+        for n, (unique_id, flag) in enumerate(flags.items(), 1) if unique_id not in unlisted
     ]}})
     for n, (unique_id, flag) in enumerate(flags.items(), 1):
         cloud.on("GET", item_lookup_path(unique_id), {"d": {"Id": n, "HasUniqueRoleAssignments": flag}})
@@ -1483,16 +1510,31 @@ def sharepoint_calls(cloud: MicrosoftCloudStub) -> list[str]:
     return kinds
 
 
-async def certificate_connector(db: FakeRecordsDb, checkpoints: FakeCheckpointStore) -> OneDriveConnector:
+def certificate_config(**auth: str | None) -> dict[str, Any]:
+    """The connector config with the certificate uploaded; an ``auth`` value of None removes that field."""
     config = onedrive_config()
-    config["auth"].update({"certificate": CERTIFICATE, "privateKey": PRIVATE_KEY})
+    config["auth"].update({"certificate": CERTIFICATE, "privateKey": PRIVATE_KEY, **auth})
+    config["auth"] = {k: v for k, v in config["auth"].items() if v is not None}
+    return config
+
+
+async def certificate_connector(db: FakeRecordsDb, checkpoints: FakeCheckpointStore, **auth: str | None) -> OneDriveConnector:
     connector = OneDriveConnector(
-        logging.getLogger("test.onedrive"), db, checkpoints, FakeConfigService(CONNECTOR_ID, config),
+        logging.getLogger("test.onedrive"), db, checkpoints, FakeConfigService(CONNECTOR_ID, certificate_config(**auth)),
         CONNECTOR_ID, "team", "creator-1",
     )
     connector._notification_service = RecordingNotifications()
     assert await connector.init() is True
     return connector
+
+
+def permission_state(checkpoints: FakeCheckpointStore) -> dict[str, Any]:
+    return checkpoints.values_for(f"drivePermissions/drives/{DRIVE}") or {}
+
+
+def changed(item_id: str, name: str, unique_id: str, version: int, **kwargs: object) -> dict[str, Any]:
+    """A drive item as a later delta page reports it once it changed."""
+    return drive_item(item_id, name, etag=guid_etag(unique_id, version), modified=f"2024-06-0{version}T10:00:00Z", **kwargs)
 
 
 def inheritance_drive(tenant: Tenant) -> TokenFeed:
@@ -1659,3 +1701,647 @@ class TestCertificatePem:
     ])
     def test_anything_but_a_pkcs8_key_and_a_certificate_is_refused(self, auth: dict[str, str]) -> None:
         assert certificate_pem(auth) is None
+
+    def test_crlf_line_endings_and_surrounding_space_are_accepted(self) -> None:
+        crlf = {"certificate": f"  {CERTIFICATE}\n".replace("\n", "\r\n"), "privateKey": PRIVATE_KEY.replace("\n", "\r\n")}
+        assert certificate_pem(crlf) == f"{PRIVATE_KEY}\n{CERTIFICATE}\n".encode()
+
+
+class TestCertificateProblems:
+    """What an admin is told about an upload that can't be used, before any sign-in."""
+
+    def test_a_usable_pair_has_no_problem(self) -> None:
+        assert certificate_problem({"certificate": CERTIFICATE, "privateKey": PRIVATE_KEY}) is None
+
+    def test_a_key_of_another_certificate_is_named(self) -> None:
+        _, other_key = self_signed_certificate()
+        assert "does not belong to the client certificate" in certificate_problem(
+            {"certificate": CERTIFICATE, "privateKey": other_key}
+        )
+
+    def test_an_expired_certificate_is_named_with_its_date(self) -> None:
+        expired, key = self_signed_certificate(valid_days=1, start_days_ago=10)
+        assert "expired on" in certificate_problem({"certificate": expired, "privateKey": key})
+
+    def test_a_certificate_not_yet_valid_is_named(self) -> None:
+        future, key = self_signed_certificate(start_days_ago=-5)
+        assert "not valid until" in certificate_problem({"certificate": future, "privateKey": key})
+
+    def test_an_rsa_key_comes_with_the_command_that_converts_it(self) -> None:
+        problem = certificate_problem({"certificate": CERTIFICATE, "privateKey": "-----BEGIN RSA PRIVATE KEY-----\nx\n-----END RSA PRIVATE KEY-----"})
+        assert "PKCS#1" in problem and "openssl pkcs8 -topk8 -nocrypt" in problem
+
+    def test_an_encrypted_key_is_named(self) -> None:
+        problem = certificate_problem({"certificate": CERTIFICATE, "privateKey": "-----BEGIN ENCRYPTED PRIVATE KEY-----\nx\n-----END ENCRYPTED PRIVATE KEY-----"})
+        assert "encrypted" in problem
+
+    def test_a_missing_certificate_is_named(self) -> None:
+        assert "client certificate is missing" in certificate_problem({"privateKey": PRIVATE_KEY})
+
+
+def failing_certificate_sign_in(cloud: MicrosoftCloudStub, code: str = "AADSTS700027") -> None:
+    """Sign-in with the certificate is refused; with the secret it still works.
+
+    The ``sharepoint_rest`` fixture stands the certificate credential in with the secret "cert".
+    """
+    def sign_in(request: httpx.Request) -> httpx.Response:
+        form = {k: v[0] for k, v in parse_qs(request.content.decode()).items()}
+        if form.get("client_secret") == "cert":
+            return json_response({"error": "invalid_client", "error_description": f"{code}: The certificate is not registered on application."}, status=401)
+        return cloud._issue_token(request)
+
+    cloud.on("POST", TOKEN_PATH, sign_in)
+
+
+def notification_titles(sent: list[dict[str, Any]]) -> list[str]:
+    return [n.get("title") for n in sent]
+
+
+INHERITANCE_WARNING = "OneDrive can't read inherited permissions"
+
+
+class TestCertificateSignIn:
+    """The secret stays Graph's credential where there is one; the certificate alone is enough too."""
+
+    async def test_with_a_secret_graph_keeps_signing_in_with_it(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
+        await certificate_connector(db, checkpoints)
+
+        assert not sharepoint_rest, "the certificate is only for SharePoint while a secret is configured"
+        assert [form.get("client_secret") for form in cloud.token_requests()] == ["secret-1"]
+
+    async def test_a_certificate_alone_signs_in_to_graph_and_sharepoint(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
+        inheritance_drive(tenant)
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
+        connector = await certificate_connector(db, checkpoints, clientSecret=None)
+
+        await connector.run_sync()
+
+        assert sharepoint_rest, "Graph signed in with the certificate"
+        assert {form.get("client_secret") for form in cloud.token_requests()} == {"cert"}
+        assert db.inherit_edges["f1"] is True
+
+    async def test_neither_a_secret_nor_a_certificate_stops_init(self, db, checkpoints, sharepoint_rest) -> None:
+        with pytest.raises(ValueError, match="Configure a client secret, or a client certificate"):
+            await certificate_connector(db, checkpoints, clientSecret=None, certificate=None, privateKey=None)
+
+    async def test_an_unusable_upload_without_a_secret_stops_init_with_the_reason(self, db, checkpoints, sharepoint_rest) -> None:
+        with pytest.raises(ValueError, match="private key is missing"):
+            await certificate_connector(db, checkpoints, clientSecret=None, privateKey=None)
+
+    @pytest.mark.parametrize("upload", [
+        pytest.param({"privateKey": None}, id="only-the-certificate"),
+        pytest.param({"certificate": None}, id="only-the-key"),
+        pytest.param({"privateKey": self_signed_certificate()[1]}, id="key-of-another-certificate"),
+        pytest.param({"certificate": "not a certificate"}, id="not-pem"),
+        pytest.param({"privateKey": "-----BEGIN RSA PRIVATE KEY-----\nx\n-----END RSA PRIVATE KEY-----"}, id="rsa-key"),
+        pytest.param(dict(zip(("certificate", "privateKey"), self_signed_certificate(valid_days=1, start_days_ago=10))), id="expired"),
+    ])
+    async def test_an_unusable_upload_beside_a_secret_leaves_the_sync_as_it_was(
+        self, cloud, tenant, db, checkpoints, sharepoint_rest, upload
+    ) -> None:
+        inheritance_drive(tenant)
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
+        connector = await certificate_connector(db, checkpoints, **upload)
+
+        await connector.run_sync()
+
+        assert connector.scope_reader is None
+        assert not sharepoint_calls(cloud)
+        assert db.inherit_edges["f1"] is False
+        assert (EntityType.USER, "u-ben", "ben@acme.com", PermissionType.READ) in perms(db, "f1")
+        assert permission_state(checkpoints) == {}
+
+    async def test_re_initialising_a_certificate_only_connector_signs_in_with_the_certificate_again(
+        self, cloud, db, checkpoints, sharepoint_rest
+    ) -> None:
+        connector = await certificate_connector(db, checkpoints, clientSecret=None)
+        sign_ins = len(sharepoint_rest)
+
+        async def closed_transport(*_: object, **__: object) -> None:
+            raise RuntimeError("HTTP transport has already been closed")
+
+        connector.credential.get_token = closed_transport
+        await connector._reinitialize_credential_if_needed()
+
+        assert len(sharepoint_rest) == sign_ins + 1
+
+
+class TestConnectionCheck:
+    """The setup form's check: it blocks a save only on an answer that settles it."""
+
+    @staticmethod
+    def auth(**values: str | None) -> dict[str, Any]:
+        auth = {"tenantId": TENANT, "clientId": "client-1", "clientSecret": "secret-1", **values}
+        return {k: v for k, v in auth.items() if v is not None}
+
+    async def check(self, auth: dict[str, Any]) -> ConnectionCheckResult:
+        return await OneDriveConnector.check_connection(auth, logging.getLogger("test.onedrive.check"))
+
+    async def test_a_working_secret_passes_and_says_what_a_certificate_adds(self, cloud) -> None:
+        result = await self.check(self.auth())
+
+        assert result.success is True
+        assert "Upload a client certificate" in result.message
+        assert not [r for r in cloud.requests if r.url.host.endswith("sharepoint.com")]
+
+    async def test_a_rejected_secret_is_named(self, cloud) -> None:
+        cloud.token_failure = json_response({"error": "invalid_client", "error_description": "AADSTS7000215: Invalid client secret provided."}, status=401)
+
+        result = await self.check(self.auth())
+
+        assert result.success is False
+        assert result.message.startswith("Microsoft Entra ID rejected the client secret: AADSTS7000215")
+
+    async def test_an_unknown_tenant_names_the_tenant_id_not_the_secret(self, cloud) -> None:
+        cloud.token_failure = json_response({"error": "invalid_request", "error_description": "AADSTS90002: Tenant not found."}, status=400)
+
+        result = await self.check(self.auth())
+
+        assert result.success is False
+        assert "Directory (Tenant) ID" in result.message
+
+    async def test_a_certificate_not_registered_on_the_app_is_named(self, cloud, sharepoint_rest) -> None:
+        failing_certificate_sign_in(cloud)
+
+        result = await self.check(self.auth(certificate=CERTIFICATE, privateKey=PRIVATE_KEY))
+
+        assert result.success is False
+        assert "rejected the client certificate: AADSTS700027" in result.message
+
+    async def test_a_certificate_alone_passes(self, cloud, sharepoint_rest) -> None:
+        result = await self.check(self.auth(clientSecret=None, certificate=CERTIFICATE, privateKey=PRIVATE_KEY))
+
+        assert result.success is True
+        assert {form.get("client_secret") for form in cloud.token_requests()} == {"cert"}
+
+    async def test_an_unusable_upload_fails_before_any_sign_in(self, cloud, sharepoint_rest) -> None:
+        result = await self.check(self.auth(certificate=CERTIFICATE, privateKey=self_signed_certificate()[1]))
+
+        assert result.success is False
+        assert "does not belong to the client certificate" in result.message
+        assert "remove the certificate and key" in result.message
+        assert not cloud.token_requests()
+
+    async def test_microsoft_out_of_reach_lets_the_save_go_ahead(self, cloud, monkeypatch) -> None:
+        class Unreachable:
+            def __init__(self, **_: object) -> None:
+                pass
+
+            async def __aenter__(self) -> "Unreachable":
+                return self
+
+            async def __aexit__(self, *_: object) -> None:
+                return None
+
+            async def get_token(self, *_: object) -> None:
+                raise ServiceRequestError("connection refused")
+
+        monkeypatch.setattr(f"{MODULE}.ClientSecretCredential", Unreachable)
+
+        result = await self.check(self.auth())
+
+        assert result.success is True, "before this check existed the save went ahead; a network error can't settle anything"
+
+
+class TestSharePointRefusals:
+    """SharePoint refusing the app: the run carries on with each item's own access list, and says why once."""
+
+    async def test_a_refused_certificate_sign_in_stops_sharepoint_reads_for_the_run_and_warns_once(
+        self, cloud, tenant, db, checkpoints, sharepoint_rest
+    ) -> None:
+        inheritance_drive(tenant)
+        ben = tenant.add_user("u-ben", "ben@acme.com", "Ben")
+        ben.by_token[None] = page([drive_item("b1", "notes.pdf", parent="root-ben", drive="drive-ben", etag=guid_etag(SHARED_UNIQUE_ID))],
+                                  delta_link=delta_link("u-ben", "B1"))
+        tenant.share("b1", [user_grant("u-ben", "ben@acme.com", "owner")], drive="drive-ben")
+        cloud.on("GET", "/v1.0/drives/drive-ben", {"id": "drive-ben", "sharePointIds": {
+            "listId": LIST_ID, "siteUrl": "https://acme-my.sharepoint.com/personal/ben_acme_com"}})
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
+        failing_certificate_sign_in(cloud)
+        connector = await certificate_connector(db, checkpoints)
+
+        await connector.run_sync()
+
+        assert not sharepoint_calls(cloud)
+        assert len([f for f in cloud.token_requests() if f.get("client_secret") == "cert"]) == 1, (
+            "not tried again for every item, nor for Ben's drive"
+        )
+        assert "b1" in db.records
+        assert db.inherit_edges["f1"] is False
+        assert (EntityType.USER, "u-ben", "ben@acme.com", PermissionType.READ) in perms(db, "f1")
+        assert notification_titles(await notes(connector)).count(INHERITANCE_WARNING) == 1
+
+    async def test_a_401_from_sharepoint_warns_about_the_certificate(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
+        inheritance_drive(tenant)
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
+        cloud.on("GET", LIST_REST, json_response({"error": {"message": {"value": "Unsupported app only token."}}}, status=401))
+        connector = await certificate_connector(db, checkpoints)
+
+        await connector.run_sync()
+
+        sent = [n for n in await notes(connector) if n.get("title") == INHERITANCE_WARNING]
+        assert len(sent) == 1 and "certificate" in sent[0]["message"]
+
+    async def test_a_403_asks_for_the_sharepoint_permission(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
+        inheritance_drive(tenant)
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
+        cloud.on("GET", LIST_REST, json_response({"error": {"message": {"value": "Access denied."}}}, status=403))
+        connector = await certificate_connector(db, checkpoints)
+
+        await connector.run_sync()
+
+        sent = [n for n in await notes(connector) if n.get("title") == INHERITANCE_WARNING]
+        assert len(sent) == 1 and "SharePoint API (not Microsoft Graph)" in sent[0]["message"]
+        assert db.inherit_edges["f1"] is False
+
+    async def test_a_404_on_one_drive_sends_no_notification(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
+        inheritance_drive(tenant)
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
+        cloud.on("GET", LIST_REST, json_response({"error": {"message": {"value": "List does not exist."}}}, status=404))
+        connector = await certificate_connector(db, checkpoints)
+
+        await connector.run_sync()
+
+        assert INHERITANCE_WARNING not in notification_titles(await notes(connector))
+        assert db.inherit_edges["f1"] is False
+
+
+def reordered_drive(tenant: Tenant) -> TokenFeed:
+    """``inheritance_drive`` with f1 last: two lookups (d1, f2) reach the cost of a full read, so f1 is answered by it."""
+    feed = inheritance_drive(tenant)
+    root, d1, f1, f2 = feed.by_token[None]["value"]
+    feed.by_token[None] = page([root, d1, f2, f1], delta_link=delta_link("u-ana", "D1"))
+    return feed
+
+
+class TestLookups:
+    """How SharePoint is asked: one item at a time for a few, the whole list once that costs less."""
+
+    async def test_one_change_in_a_large_drive_is_looked_up_on_its_own(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
+        inheritance_drive(tenant)
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,), item_count=50_000)
+        connector = await certificate_connector(db, checkpoints)
+
+        await connector.run_sync()
+
+        assert "items" not in sharepoint_calls(cloud), "three lookups cost far less than 10 pages of 5000 items"
+        assert db.inherit_edges["f1"] is True
+
+    async def test_a_drive_without_changes_asks_sharepoint_nothing(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
+        feed = inheritance_drive(tenant)
+        feed.by_token["D1"] = page([], delta_link=delta_link("u-ana", "D2"))
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
+        connector = await certificate_connector(db, checkpoints)
+        await connector.run_sync()
+        before = len(sharepoint_calls(cloud))
+
+        await connector.run_sync()
+
+        assert len(sharepoint_calls(cloud)) == before
+
+    async def test_an_item_the_full_read_did_not_see_is_asked_on_its_own_not_taken_to_inherit(
+        self, cloud, tenant, db, checkpoints, sharepoint_rest
+    ) -> None:
+        reordered_drive(tenant)
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,), unlisted=(INHERITING_UNIQUE_ID,))
+        cloud.on("GET", item_lookup_path(INHERITING_UNIQUE_ID), {"d": {"Id": 9, "HasUniqueRoleAssignments": True}})
+        tenant.share("f1", [user_grant("u-ana", "ana@acme.com", "owner"), user_grant("u-dee", "dee@acme.com")])
+        connector = await certificate_connector(db, checkpoints)
+
+        await connector.run_sync()
+
+        assert sharepoint_calls(cloud)[:6] == [
+            "list", f"item {FOLDER_UNIQUE_ID}", f"item {SHARED_UNIQUE_ID}", "list", "items", f"item {INHERITING_UNIQUE_ID}",
+        ], "asked on its own while the pass writes it, not found unique only by the check after the pass"
+        assert db.inherit_edges["f1"] is False
+        assert (EntityType.USER, "u-dee", "dee@acme.com", PermissionType.READ) in perms(db, "f1")
+
+    async def test_a_listed_item_without_the_flag_is_asked_on_its_own(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
+        reordered_drive(tenant)
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
+        cloud.on("GET", f"{LIST_REST}/items", {"d": {"results": [
+            {"Id": 1, "UniqueId": FOLDER_UNIQUE_ID, "HasUniqueRoleAssignments": True},
+            {"Id": 2, "UniqueId": SHARED_UNIQUE_ID, "HasUniqueRoleAssignments": True},
+            {"Id": 3, "UniqueId": INHERITING_UNIQUE_ID},
+        ]}})
+        connector = await certificate_connector(db, checkpoints)
+
+        await connector.run_sync()
+
+        calls = sharepoint_calls(cloud)
+        assert calls.index(f"item {INHERITING_UNIQUE_ID}") > calls.index("items")
+        assert db.inherit_edges["f1"] is True
+
+    async def test_an_item_that_broke_inheritance_during_the_pass_is_corrected_before_the_run_ends(
+        self, cloud, tenant, db, checkpoints, sharepoint_rest
+    ) -> None:
+        reordered_drive(tenant)
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
+        listing = lambda f1_unique: {"d": {"results": [  # noqa: E731
+            {"Id": 1, "UniqueId": FOLDER_UNIQUE_ID, "HasUniqueRoleAssignments": True},
+            {"Id": 2, "UniqueId": SHARED_UNIQUE_ID, "HasUniqueRoleAssignments": True},
+            {"Id": 3, "UniqueId": INHERITING_UNIQUE_ID, "HasUniqueRoleAssignments": f1_unique},
+        ]}}
+        # The first read, then the check after the pass: Ana shared f1 with Dee in between.
+        cloud.on("GET", f"{LIST_REST}/items", [listing(False), listing(True)])
+        cloud.on("GET", item_lookup_path(INHERITING_UNIQUE_ID), {"d": {"Id": 3, "HasUniqueRoleAssignments": True}})
+        tenant.share("f1", [user_grant("u-ana", "ana@acme.com", "owner"), user_grant("u-dee", "dee@acme.com")])
+        connector = await certificate_connector(db, checkpoints)
+
+        await connector.run_sync()
+
+        assert db.inherit_edges["f1"] is False, "an item written as inheriting from a stale read would keep the folder's audience"
+        assert (EntityType.USER, "u-dee", "dee@acme.com", PermissionType.READ) in perms(db, "f1")
+        assert not permission_state(checkpoints).get("recheck")
+
+    async def test_a_list_longer_than_a_page_is_read_to_the_end(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
+        reordered_drive(tenant)
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
+        cloud.on("GET", f"{LIST_REST}/items", [
+            {"d": {"results": [{"Id": 1, "UniqueId": FOLDER_UNIQUE_ID, "HasUniqueRoleAssignments": True},
+                               {"Id": 2, "UniqueId": SHARED_UNIQUE_ID, "HasUniqueRoleAssignments": True}],
+                   "__next": f"{PERSONAL_SITE}/_api/web/lists(guid'{LIST_ID}')/items?$skiptoken=Paged%3dTRUE%26p_ID%3d2"}},
+            {"d": {"results": [{"Id": 3, "UniqueId": INHERITING_UNIQUE_ID, "HasUniqueRoleAssignments": True}]}},
+        ])
+        tenant.share("f1", [user_grant("u-ana", "ana@acme.com", "owner"), user_grant("u-dee", "dee@acme.com")])
+        connector = await certificate_connector(db, checkpoints)
+
+        await connector.run_sync()
+
+        assert db.inherit_edges["f1"] is False, "f1 is unique on the second page"
+
+    async def test_throttled_reads_are_retried(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
+        inheritance_drive(tenant)
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
+        cloud.on("GET", item_lookup_path(INHERITING_UNIQUE_ID), [
+            json_response({"error": "throttled"}, status=429, headers={"Retry-After": "0"}),
+            {"d": {"Id": 3, "HasUniqueRoleAssignments": False}},
+        ])
+        connector = await certificate_connector(db, checkpoints)
+
+        await connector.run_sync()
+
+        assert db.inherit_edges["f1"] is True
+
+    async def test_one_sharepoint_token_serves_the_whole_run(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
+        inheritance_drive(tenant)
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
+        connector = await certificate_connector(db, checkpoints)
+
+        await connector.run_sync()
+
+        assert len(sharepoint_calls(cloud)) > 2
+        assert len([f for f in cloud.token_requests() if "sharepoint.com" in f.get("scope", "")]) == 1
+
+
+class TestMigration:
+    """A drive stored before the certificate is rewritten onto inheritance once, without losing changes."""
+
+    async def secret_only_then_certificate(self, cloud, tenant, db, checkpoints) -> tuple[TokenFeed, OneDriveConnector]:
+        feed = inheritance_drive(tenant)
+        feed.by_token["D1"] = page([], delta_link=delta_link("u-ana", "D2"))
+        feed.by_token["D2"] = page([], delta_link=delta_link("u-ana", "D3"))
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
+        await (await ready_connector(db, checkpoints)).run_sync()
+        assert db.inherit_edges["f1"] is False and perms(db, "f1")
+        return feed, await certificate_connector(db, checkpoints)
+
+    async def test_without_a_certificate_no_permission_state_is_kept(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
+        inheritance_drive(tenant)
+        await (await ready_connector(db, checkpoints)).run_sync()
+
+        assert permission_state(checkpoints) == {}
+
+    async def test_a_drive_synced_before_the_certificate_is_rewritten_onto_inheritance(
+        self, cloud, tenant, db, checkpoints, sharepoint_rest
+    ) -> None:
+        feed, connector = await self.secret_only_then_certificate(cloud, tenant, db, checkpoints)
+        content_updates = len(db.content_updates)
+
+        await connector.run_sync()
+
+        assert db.inherit_edges["f1"] is True and db.record_permissions["f1"] == []
+        assert db.inherit_edges["f2"] is False
+        assert (EntityType.USER, "u-cal", "cal@acme.com", PermissionType.READ) in perms(db, "f2")
+        assert db.inherit_edges["d1"] is False and db.inherit_edges["root-ana"] is False
+        assert permission_state(checkpoints)["mode"] == "inheritance"
+        assert feed.seen == [None, "D1", None], "the normal delta first, then one full enumeration"
+        assert drive_checkpoint(checkpoints)["deltaLink"] == delta_link("u-ana", "D2"), (
+            "the enumeration's own link is thrown away, so changes made while it ran are still read next time"
+        )
+        assert len(db.content_updates) == content_updates, "a rewrite of access re-indexes nothing"
+
+    async def test_the_rewrite_happens_once(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
+        feed, connector = await self.secret_only_then_certificate(cloud, tenant, db, checkpoints)
+        await connector.run_sync()
+        writes = len(db.permission_updates)
+
+        await connector.run_sync()
+
+        assert feed.seen == [None, "D1", None, "D2"]
+        assert len(db.permission_updates) == writes
+
+    async def test_a_first_sync_with_the_certificate_needs_no_rewrite(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
+        feed = inheritance_drive(tenant)
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
+        connector = await certificate_connector(db, checkpoints)
+
+        await connector.run_sync()
+
+        assert feed.seen == [None]
+        assert permission_state(checkpoints)["mode"] == "inheritance"
+
+    async def test_an_interrupted_rewrite_resumes_where_it_stopped(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
+        feed, connector = await self.secret_only_then_certificate(cloud, tenant, db, checkpoints)
+        root, d1, f1, f2 = feed.by_token[None]["value"]
+        feed.by_token[None] = page([root, d1], next_link=delta_link("u-ana", "M2"))
+        feed.by_token["M2"] = [graph_error(400, "invalidRequest", "page unavailable"), page([f1, f2], delta_link=delta_link("u-ana", "M3"))]
+
+        await connector.run_sync()
+        assert permission_state(checkpoints)["migrationNextLink"] == delta_link("u-ana", "M2")
+        assert permission_state(checkpoints).get("mode") is None
+        await connector.run_sync()
+
+        assert feed.seen == [None, "D1", None, "M2", "D2", "M2"], "resumed from its own cursor, not started over"
+        assert permission_state(checkpoints)["mode"] == "inheritance"
+        assert db.inherit_edges["f1"] is True and db.record_permissions["f1"] == []
+
+    async def test_a_rewrite_that_keeps_failing_starts_over(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
+        feed, connector = await self.secret_only_then_certificate(cloud, tenant, db, checkpoints)
+        root, d1, *_ = feed.by_token[None]["value"]
+        feed.by_token[None] = page([root, d1], next_link=delta_link("u-ana", "M2"))
+        feed.by_token["M2"] = graph_error(400, "invalidRequest", "page unavailable")
+        for token in ("D2", "D3", "D4", "D5"):
+            feed.by_token[token] = page([], delta_link=delta_link("u-ana", f"D{int(token[1]) + 1}"))
+
+        for _ in range(MAX_PAGE_ATTEMPTS):
+            await connector.run_sync()
+
+        assert permission_state(checkpoints)["migrationNextLink"] is None
+        assert permission_state(checkpoints)["migrationFailures"] == 0
+
+    async def test_a_transient_failure_in_inheritance_mode_queues_only_the_items_it_touched(
+        self, cloud, tenant, db, checkpoints, sharepoint_rest
+    ) -> None:
+        feed = inheritance_drive(tenant)
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
+        connector = await certificate_connector(db, checkpoints)
+        await connector.run_sync()
+        feed.by_token["D1"] = page([changed("f1", "plan.pdf", INHERITING_UNIQUE_ID, 2, parent="d1")], delta_link=delta_link("u-ana", "D2"))
+        feed.by_token["D2"] = page([], delta_link=delta_link("u-ana", "D3"))
+        unavailable = json_response({"error": "busy"}, status=503, headers={"Retry-After": "0"})
+        cloud.on("GET", item_lookup_path(INHERITING_UNIQUE_ID), unavailable)
+
+        await connector.run_sync()
+
+        assert db.inherit_edges["f1"] is False, "unknown: it keeps the access list OneDrive reports for it"
+        assert (EntityType.USER, "u-ben", "ben@acme.com", PermissionType.READ) in perms(db, "f1")
+        assert permission_state(checkpoints)["recheck"] == ["f1"]
+        assert permission_state(checkpoints)["mode"] == "inheritance"
+
+        cloud.on("GET", item_lookup_path(INHERITING_UNIQUE_ID), {"d": {"Id": 3, "HasUniqueRoleAssignments": False}})
+        await connector.run_sync()
+
+        assert db.inherit_edges["f1"] is True and db.record_permissions["f1"] == []
+        assert permission_state(checkpoints)["recheck"] == []
+        assert feed.seen == [None, "D1", "D2"], "no full rewrite for a transient failure"
+
+    async def test_too_many_unanswered_items_rewrite_the_drive_once_sharepoint_answers_again(
+        self, cloud, tenant, db, checkpoints, sharepoint_rest, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(f"{MODULE}.MAX_RECHECK_ITEMS", 1)
+        feed = inheritance_drive(tenant)
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
+        connector = await certificate_connector(db, checkpoints)
+        await connector.run_sync()
+        feed.by_token["D1"] = page([
+            changed("f1", "plan.pdf", INHERITING_UNIQUE_ID, 2, parent="d1"),
+            changed("f2", "budget.pdf", SHARED_UNIQUE_ID, 2, parent="d1", shared=True),
+        ], delta_link=delta_link("u-ana", "D2"))
+        feed.by_token["D2"] = page([], delta_link=delta_link("u-ana", "D3"))
+        cloud.on("GET", f"/v1.0/drives/{DRIVE}", graph_error(400, "invalidRequest"))
+
+        await connector.run_sync()
+        assert permission_state(checkpoints)["mode"] == "itemAcl"
+
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
+        await connector.run_sync()
+
+        assert feed.seen == [None, "D1", "D2", None]
+        assert permission_state(checkpoints)["mode"] == "inheritance"
+        assert db.inherit_edges["f1"] is True
+
+    async def test_removing_the_certificate_keeps_inheritance_and_queues_what_changed(
+        self, cloud, tenant, db, checkpoints, sharepoint_rest
+    ) -> None:
+        feed = inheritance_drive(tenant)
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
+        await (await certificate_connector(db, checkpoints)).run_sync()
+        feed.by_token["D1"] = page([changed("f1", "plan.pdf", INHERITING_UNIQUE_ID, 2, parent="d1")], delta_link=delta_link("u-ana", "D2"))
+        before = len(sharepoint_calls(cloud))
+
+        await (await ready_connector(db, checkpoints)).run_sync()
+
+        assert len(sharepoint_calls(cloud)) == before
+        assert db.inherit_edges["f1"] is False
+        assert (EntityType.USER, "u-ben", "ben@acme.com", PermissionType.READ) in perms(db, "f1")
+        assert permission_state(checkpoints)["recheck"] == ["f1"]
+        assert permission_state(checkpoints)["mode"] == "inheritance"
+
+
+class TestFailClosed:
+    """An item SharePoint calls unique never keeps its folder's audience through a stale inherit edge."""
+
+    async def test_a_file_that_turned_unique_with_an_unreadable_list_loses_its_inherit_edge(
+        self, cloud, tenant, db, checkpoints, sharepoint_rest
+    ) -> None:
+        feed = inheritance_drive(tenant)
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
+        connector = await certificate_connector(db, checkpoints)
+        await connector.run_sync()
+        assert db.inherit_edges["f1"] is True
+        feed.by_token["D1"] = page([changed("f1", "plan.pdf", INHERITING_UNIQUE_ID, 2, parent="d1")], delta_link=delta_link("u-ana", "D2"))
+        cloud.on("GET", item_lookup_path(INHERITING_UNIQUE_ID), {"d": {"Id": 3, "HasUniqueRoleAssignments": True}})
+        tenant.share("f1", graph_error(403, "accessDenied"))
+
+        await connector.run_sync()
+
+        assert db.inherit_edges["f1"] is False
+        assert db.record_permissions["f1"] == [], "its stored grants (none) stand until its list can be read"
+
+    async def test_the_folder_walk_drops_the_inherit_edge_of_a_unique_child_it_cannot_read(
+        self, cloud, tenant, db, checkpoints, sharepoint_rest
+    ) -> None:
+        feed = tenant.add_user("u-ana", "ana@acme.com", "Ana")
+        feed.by_token[None] = page([
+            root_item(),
+            drive_item("d1", "Plans", folder=True, etag=guid_etag(FOLDER_UNIQUE_ID)),
+            drive_item("f1", "plan.pdf", parent="d1", etag=guid_etag(INHERITING_UNIQUE_ID)),
+        ], delta_link=delta_link("u-ana", "D1"))
+        owner = user_grant("u-ana", "ana@acme.com", "owner")
+        tenant.share("root-ana", [owner])
+        tenant.share("d1", [owner])
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
+        connector = await certificate_connector(db, checkpoints)
+        await connector.run_sync()
+        assert db.inherit_edges["f1"] is True
+        # d1 is shared with Ben; f1 broke inheritance and its list can't be read.
+        feed.by_token["D1"] = page([changed("d1", "Plans", FOLDER_UNIQUE_ID, 2, folder=True, shared=True)], delta_link=delta_link("u-ana", "D2"))
+        tenant.share("d1", [owner, user_grant("u-ben", "ben@acme.com")])
+        cloud.on("GET", f"/v1.0/drives/{DRIVE}/items/d1/children", page([drive_item("f1", "plan.pdf", parent="d1", etag=guid_etag(INHERITING_UNIQUE_ID))]))
+        cloud.on("GET", item_lookup_path(INHERITING_UNIQUE_ID), {"d": {"Id": 3, "HasUniqueRoleAssignments": True}})
+        tenant.share("f1", graph_error(403, "accessDenied"))
+
+        await connector.run_sync()
+
+        assert db.inherit_edges["f1"] is False, "through the edge, Ben would have reached a file that broke inheritance"
+        assert (EntityType.USER, "u-ben", "ben@acme.com", PermissionType.READ) not in perms(db, "f1")
+
+
+class TestOtherPaths:
+    async def test_a_pending_access_read_of_an_inheriting_item_needs_no_graph_read(
+        self, cloud, tenant, db, checkpoints, sharepoint_rest
+    ) -> None:
+        feed = inheritance_drive(tenant)
+        feed.by_token["D1"] = page([], delta_link=delta_link("u-ana", "D2"))
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
+        connector = await certificate_connector(db, checkpoints)
+        await connector.run_sync()
+        await checkpoints.update_sync_point(next(k for k in checkpoints.sync_points if k.endswith("/users/u-ana")), {"pendingAccessReads": ["f1"]})
+        graph_reads = len(cloud.calls("GET", f"/v1.0/drives/{DRIVE}/items/f1/permissions"))
+
+        await connector.run_sync()
+
+        assert len(cloud.calls("GET", f"/v1.0/drives/{DRIVE}/items/f1/permissions")) == graph_reads
+        assert db.permission_updates[-1][0].external_record_id == "f1"
+        assert db.inherit_edges["f1"] is True and db.record_permissions["f1"] == []
+        assert drive_checkpoint(checkpoints)["pendingAccessReads"] == []
+
+    async def test_reindexing_one_record_asks_sharepoint_about_that_item_only(
+        self, cloud, tenant, db, checkpoints, sharepoint_rest
+    ) -> None:
+        inheritance_drive(tenant)
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
+        connector = await certificate_connector(db, checkpoints)
+        await connector.run_sync()
+        cloud.on("GET", f"/v1.0/drives/{DRIVE}/items/f1",
+                 changed("f1", "plan.pdf", INHERITING_UNIQUE_ID, 2, parent="d1"))
+        before = len(sharepoint_calls(cloud))
+
+        await connector.reindex_records([await db.get_record_by_external_id(CONNECTOR_ID, "f1")])
+
+        assert sharepoint_calls(cloud)[before:] == ["list", f"item {INHERITING_UNIQUE_ID}"]
+
+    async def test_a_reindex_keeps_the_runs_refusal(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
+        inheritance_drive(tenant)
+        connector = await certificate_connector(db, checkpoints)
+        connector._sharepoint_refusal = "refused earlier this run"
+
+        await connector.reindex_records([])
+        await connector.reindex_records([FileRecord(
+            id="r1", record_name="x.pdf", record_type=RecordType.FILE, external_record_id="missing",
+            external_record_group_id=DRIVE, version=0, origin=OriginTypes.CONNECTOR,
+            connector_name=Connectors.ONEDRIVE, connector_id=CONNECTOR_ID, is_file=True, extension="pdf",
+        )])
+
+        assert connector._sharepoint_refusal == "refused earlier this run"
