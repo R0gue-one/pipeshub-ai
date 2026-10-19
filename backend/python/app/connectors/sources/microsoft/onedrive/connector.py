@@ -631,10 +631,11 @@ class OneDriveConnector(BaseConnector):
 
     async def _suggest_certificate_once(self) -> None:
         """Tell the admin of a connector without a certificate what one would add; once per connector."""
-        if self.scope_reader is not None or has_certificate_fields(self.config.get("credentials", {}).get("auth", {})):
-            return
         key = generate_record_sync_point_key("permissionNotices", "connector", "certificate")
         try:
+            auth_config = getattr(self, "config", {}).get("credentials", {}).get("auth", {})
+            if self.scope_reader is not None or has_certificate_fields(auth_config):
+                return
             if (await self.drive_delta_sync_point.read_sync_point(key) or {}).get("sent"):
                 return
             outcome = await self.notify_and_wait(
