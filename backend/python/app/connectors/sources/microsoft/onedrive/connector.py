@@ -94,7 +94,7 @@ from app.models.entities import (
     RecordType,
 )
 from app.models.permission import EntityType, Permission, PermissionType
-from app.services.notification.types import NotificationType, NotificationSeverity
+from app.services.notification.types import NotificationOutcome, NotificationSeverity, NotificationType
 from app.utils.streaming import create_stream_record_response, stream_content
 from app.utils.time_conversion import get_epoch_timestamp_in_ms
 from app.connectors.core.base.error.stream_errors import (
@@ -628,6 +628,36 @@ class OneDriveConnector(BaseConnector):
                 await self._notify_sharepoint_permission_missing()
         self._drive_scopes[drive_id] = scope
         return scope
+
+    async def _suggest_certificate_once(self) -> None:
+        """Tell the admin of a connector without a certificate what one would add; once per connector."""
+        if self.scope_reader is not None or has_certificate_fields(self.config.get("credentials", {}).get("auth", {})):
+            return
+        key = generate_record_sync_point_key("permissionNotices", "connector", "certificate")
+        try:
+            if (await self.drive_delta_sync_point.read_sync_point(key) or {}).get("sent"):
+                return
+            outcome = await self.notify_and_wait(
+                type=NotificationType.CONNECTOR_INFO,
+                severity=NotificationSeverity.INFO,
+                title="OneDrive: let files inherit their folder's access",
+                message=(
+                    "Upload a client certificate and its private key on the connector, and grant the app the "
+                    "Sites.Read.All application permission of the SharePoint API. Files and folders then inherit "
+                    "their folder's access, so a change to a folder's sharing reaches everything inside it; stored "
+                    "items are rewritten once. Until then nothing changes, and the client secret keeps working."
+                ),
+                payload={
+                    "connector_id": self.connector_id,
+                    "connector_name": self.connector_name.value,
+                    "connector_scope": self.scope,
+                },
+                recipient_user_ids=[self.created_by],
+            )
+            if outcome is NotificationOutcome.SENT:
+                await self.drive_delta_sync_point.update_sync_point(key, {"sent": True})
+        except Exception as e:
+            self.logger.debug(f"The certificate suggestion was not sent: {e}")
 
     async def _note_sharepoint_refusal(self, error: Exception) -> None:
         if self._sharepoint_refusal is not None:
@@ -2574,6 +2604,7 @@ class OneDriveConnector(BaseConnector):
             self.sync_filters, self.indexing_filters = await load_connector_filters(
                 self.config_service, "onedrive", self.connector_id, self.logger
             )
+            await self._suggest_certificate_once()
 
             # Step 1: Sync users
             self.logger.info("Syncing users...")

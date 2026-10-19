@@ -2345,3 +2345,37 @@ class TestOtherPaths:
         )])
 
         assert connector._sharepoint_refusal == "refused earlier this run"
+
+
+SUGGESTION = "OneDrive: let files inherit their folder's access"
+
+
+class TestCertificateSuggestion:
+    """A connector set up with a secret only is told, once, what a certificate adds."""
+
+    async def test_a_secret_only_connector_is_told_once(self, cloud, tenant, db, checkpoints) -> None:
+        inheritance_drive(tenant)
+        connector = await ready_connector(db, checkpoints)
+
+        await connector.run_sync()
+        await connector.run_sync()
+        restarted = await ready_connector(db, checkpoints)
+        restarted._notification_service = connector._notification_service
+        # The backoff of notify() lives in the process; a restart forgets it, the sync point doesn't.
+        BaseConnector._notification_cache.clear()
+        await restarted.run_sync()
+        await notes(restarted)
+
+        sent = [n for n in await notes(connector) if n.get("title") == SUGGESTION]
+        assert len(sent) == 1
+        assert "SharePoint API" in sent[0]["message"] and "client secret keeps working" in sent[0]["message"]
+        assert sent[0]["recipient_user_ids"] == ["creator-1"]
+
+    async def test_a_connector_with_a_certificate_is_not_told(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
+        inheritance_drive(tenant)
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
+        connector = await certificate_connector(db, checkpoints)
+
+        await connector.run_sync()
+
+        assert SUGGESTION not in notification_titles(await notes(connector))

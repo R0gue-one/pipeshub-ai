@@ -249,8 +249,10 @@ class RecordingNotifications:
     def __init__(self) -> None:
         self.sent: list[dict[str, Any]] = []
 
-    async def publish_notification(self, **kwargs: object) -> None:
+    async def publish_notification(self, **kwargs: object) -> bool:
+        """Like the real service: True when the broker took it."""
         self.sent.append(kwargs)
+        return True
 
 
 
