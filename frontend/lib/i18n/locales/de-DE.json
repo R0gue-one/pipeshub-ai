@@ -2667,7 +2667,9 @@
           "ready": "Abgeschlossen",
           "readyTooltip": "Die Konfiguration ist abgeschlossen und authentifiziert. Die Synchronisierung kann nach der Aktivierung starten.",
           "desktopOffline": "Desktop offline",
-          "desktopOfflineTooltip": "Die Desktop-App, der dieser Ordner gehört, ist nicht verbunden. Öffnen Sie sie auf diesem Rechner, um zu synchronisieren."
+          "desktopOfflineTooltip": "Die Desktop-App, der dieser Ordner gehört, ist nicht verbunden. Öffnen Sie sie auf diesem Rechner, um zu synchronisieren.",
+          "actionNeeded": "Handlung erforderlich",
+          "actionNeededTooltip": "Erfordert Ihre Aufmerksamkeit: {{items}}"
         },
         "sync": {
           "kind": "Synchronisierung",
@@ -2914,6 +2916,11 @@
           "wholeSite": "Ganze Website",
           "onePage": "Eine Seite"
         }
+      },
+      "actionItems": {
+        "badge": "Handlung erforderlich",
+        "title": "Handlung erforderlich",
+        "openAuthentication": "Authentifizierung aktualisieren"
       }
     },
     "mcpServers": {

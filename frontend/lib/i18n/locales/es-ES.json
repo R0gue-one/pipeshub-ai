@@ -2687,7 +2687,9 @@
           "ready": "Completo",
           "readyTooltip": "La configuración está completa y autenticada. La sincronización puede ejecutarse cuando esté habilitada.",
           "desktopOffline": "Escritorio desconectado",
-          "desktopOfflineTooltip": "La aplicación de escritorio que gestiona esta carpeta no está conectada. Ábrela en ese equipo para sincronizar."
+          "desktopOfflineTooltip": "La aplicación de escritorio que gestiona esta carpeta no está conectada. Ábrela en ese equipo para sincronizar.",
+          "actionNeeded": "Acción necesaria",
+          "actionNeededTooltip": "Requiere su atención: {{items}}"
         },
         "sync": {
           "kind": "Sync",
@@ -2934,6 +2936,11 @@
           "wholeSite": "Sitio completo",
           "onePage": "Una página"
         }
+      },
+      "actionItems": {
+        "badge": "Acción necesaria",
+        "title": "Acción necesaria",
+        "openAuthentication": "Actualizar autenticación"
       }
     },
     "mcpServers": {

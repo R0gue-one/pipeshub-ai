@@ -26,6 +26,7 @@ import type {
 } from '../../types';
 import { IndexingStatsPanel } from '@/app/components/indexing-stats/indexing-stats-panel';
 import { LastRunSummary } from './last-run-summary';
+import { ActionItemsCallout } from './action-items-callout';
 
 // ========================================
 // Props
@@ -60,6 +61,7 @@ export function OverviewTab({
   const { t } = useTranslation();
   const router = useRouter();
   const closeInstancePanel = useConnectorsStore((s) => s.closeInstancePanel);
+  const openPanel = useConnectorsStore((s) => s.openPanel);
   const instanceConfigs = useConnectorsStore((s) => s.instanceConfigs);
   const setLocalSyncStatus = useConnectorsStore((s) => s.setLocalSyncStatus);
   const addToast = useToastStore((s) => s.addToast);
@@ -276,6 +278,15 @@ export function OverviewTab({
           </Text>
         </Flex>
       )}
+
+      <ActionItemsCallout
+        instance={instance}
+        onOpenAuthentication={() => {
+          // The settings panel opens on its Authenticate tab.
+          closeInstancePanel();
+          openPanel(instance, instance._key, instance.scope === 'personal' ? 'personal' : 'team');
+        }}
+      />
 
       <LastRunSummary instance={instance} />
 
