@@ -56,6 +56,7 @@ from app.connectors.sources.microsoft.onedrive.connector import (
     _drive_permissions_key,
     certificate_pem,
     certificate_problem,
+    onedrive_config_action_items,
 )
 from app.models.entities import FileRecord, RecordGroupType, RecordType
 from app.models.permission import EntityType, PermissionType
@@ -2373,18 +2374,23 @@ class TestOtherPaths:
         assert connector._sharepoint_refusal == "refused earlier this run"
 
 
-SUGGESTION = "OneDrive: let files inherit their folder's access"
+SUGGESTION = "OneDrive: switch to certificate sign-in"
+
+
+def suggestions(sent: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [n for n in sent if n.get("title") == SUGGESTION]
 
 
 class TestCertificateSuggestion:
-    """A connector set up with a secret only is told, once, what a certificate adds."""
+    """A connector still signing in with a client secret reminds its admin, from any run, at most once a week."""
 
-    async def test_a_secret_only_connector_is_told_once(self, cloud, tenant, db, checkpoints) -> None:
-        inheritance_drive(tenant)
+    async def test_scheduled_runs_remind_once_and_a_restart_does_not_repeat_it(self, cloud, tenant, db, checkpoints) -> None:
+        feed = inheritance_drive(tenant)
+        feed.by_token["D1"] = page([], delta_link=delta_link("u-ana", "D2"))
         connector = await ready_connector(db, checkpoints)
 
-        await connector.run_sync()
-        await connector.run_sync()
+        await connector.run_incremental_sync()
+        await connector.run_incremental_sync()
         restarted = await ready_connector(db, checkpoints)
         restarted._notification_service = connector._notification_service
         # The backoff of notify() lives in the process; a restart forgets it, the sync point doesn't.
@@ -2392,19 +2398,31 @@ class TestCertificateSuggestion:
         await restarted.run_sync()
         await notes(restarted)
 
-        sent = [n for n in await notes(connector) if n.get("title") == SUGGESTION]
-        assert len(sent) == 1
-        assert "SharePoint API" in sent[0]["message"] and "client secret keeps working" in sent[0]["message"]
+        sent = suggestions(await notes(connector))
+        assert len(sent) == 1, "a scheduled (incremental) run reminds too, but not on every run"
+        assert "Recommended" in sent[0]["message"] and "client secret keeps working" in sent[0]["message"]
         assert sent[0]["recipient_user_ids"] == ["creator-1"]
 
-    async def test_a_connector_with_a_certificate_is_not_told(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
+    async def test_a_week_later_it_reminds_again(self, cloud, tenant, db, checkpoints) -> None:
+        inheritance_drive(tenant)
+        connector = await ready_connector(db, checkpoints)
+        await connector.run_sync()
+        key = next(k for k in checkpoints.sync_points if k.endswith("permissionNotices/connector/certificate"))
+        sent_at = checkpoints.sync_points[key]["lastSentAt"]
+        checkpoints.sync_points[key]["lastSentAt"] = sent_at - (7 * 24 * 3600 * 1000 + 1)
+
+        await connector.run_sync()
+
+        assert len(suggestions(await notes(connector))) == 2
+
+    async def test_a_connector_with_a_certificate_is_not_reminded(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
         inheritance_drive(tenant)
         serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
         connector = await certificate_connector(db, checkpoints)
 
         await connector.run_sync()
 
-        assert SUGGESTION not in notification_titles(await notes(connector))
+        assert not suggestions(await notes(connector))
 
 
 class TestReviewFindings:
@@ -2575,3 +2593,145 @@ class TestSharingChangesLink:
         await (await ready_connector(db, checkpoints)).run_sync()
 
         assert cloud.calls("GET", DELTA_PATH)[-1].headers.get("Prefer") == "deltashowsharingchanges"
+
+
+def drive_with_sharepoint_ids(cloud: MicrosoftCloudStub) -> None:
+    cloud.on("GET", "/v1.0/users/u-ana/drive", {"id": DRIVE, "sharePointIds": {"listId": LIST_ID, "siteUrl": PERSONAL_SITE}})
+
+
+class TestConnectionCheckReadsSharePoint:
+    """With a certificate, the setup form's check also asks SharePoint; a refusal there blocks the save."""
+
+    async def check(self, **auth: str | None) -> ConnectionCheckResult:
+        return await OneDriveConnector.check_connection(TestConnectionCheck.auth(**auth), logging.getLogger("test"))
+
+    async def test_sharepoint_answering_passes(self, cloud, tenant, sharepoint_rest) -> None:
+        tenant.add_user("u-ana", "ana@acme.com", "Ana")
+        drive_with_sharepoint_ids(cloud)
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID)
+
+        result = await self.check(clientSecret=None, certificate=CERTIFICATE, privateKey=PRIVATE_KEY)
+
+        assert result.success is True and "SharePoint lets the app read" in result.message
+        assert sharepoint_calls(cloud) == ["list"]
+
+    @pytest.mark.parametrize("status", [401, 403])
+    async def test_sharepoint_refusing_the_app_fails_and_names_the_permission(self, cloud, tenant, sharepoint_rest, status) -> None:
+        tenant.add_user("u-ana", "ana@acme.com", "Ana")
+        drive_with_sharepoint_ids(cloud)
+        cloud.on("GET", LIST_REST, json_response({"error": {"message": {"value": "Access denied."}}}, status=status))
+
+        result = await self.check(clientSecret=None, certificate=CERTIFICATE, privateKey=PRIVATE_KEY)
+
+        assert result.success is False
+        assert "Sites.Read.All application permission of the SharePoint API (not Microsoft Graph)" in result.message
+
+    async def test_a_legacy_secret_with_a_new_certificate_is_checked_against_sharepoint_too(self, cloud, tenant, sharepoint_rest) -> None:
+        tenant.add_user("u-ana", "ana@acme.com", "Ana")
+        drive_with_sharepoint_ids(cloud)
+        cloud.on("GET", LIST_REST, json_response({"error": "denied"}, status=403))
+
+        result = await self.check(certificate=CERTIFICATE, privateKey=PRIVATE_KEY)
+
+        assert result.success is False
+
+    async def test_no_onedrive_to_check_with_lets_the_save_go_ahead(self, cloud, tenant, sharepoint_rest) -> None:
+        tenant.add_user("u-ana", "ana@acme.com", "Ana")
+        cloud.on("GET", "/v1.0/users/u-ana/drive", graph_error(404, "ResourceNotFound"))
+
+        result = await self.check(clientSecret=None, certificate=CERTIFICATE, privateKey=PRIVATE_KEY)
+
+        assert result.success is True and "No user has a OneDrive yet" in result.message
+        assert not sharepoint_calls(cloud)
+
+    async def test_a_secret_alone_never_asks_sharepoint(self, cloud, tenant, sharepoint_rest) -> None:
+        tenant.add_user("u-ana", "ana@acme.com", "Ana")
+
+        result = await self.check()
+
+        assert result.success is True
+        assert not sharepoint_calls(cloud)
+        assert not cloud.calls("GET", "/v1.0/users"), "a legacy secret check is a sign-in only, as before"
+
+
+def codes(items: list[Any] | None) -> list[str] | None:
+    return None if items is None else [item.code for item in items]
+
+
+class TestConfigActionItems:
+    def test_a_secret_without_a_certificate_asks_to_switch(self) -> None:
+        items = onedrive_config_action_items({"clientSecret": "s"})
+
+        assert codes(items) == ["certificate_sign_in"] and items[0].action == "authenticate"
+        assert items[0].severity == "warning"
+
+    def test_a_usable_certificate_needs_nothing(self) -> None:
+        assert onedrive_config_action_items({"certificate": CERTIFICATE, "privateKey": PRIVATE_KEY}) == []
+
+    def test_a_certificate_expiring_within_30_days_asks_for_a_new_one(self) -> None:
+        soon, key = self_signed_certificate(valid_days=20)
+
+        items = onedrive_config_action_items({"certificate": soon, "privateKey": key})
+
+        assert codes(items) == ["certificate_expiring"]
+
+    def test_an_expired_certificate_is_an_error(self) -> None:
+        expired, key = self_signed_certificate(valid_days=1, start_days_ago=10)
+
+        items = onedrive_config_action_items({"clientSecret": "s", "certificate": expired, "privateKey": key})
+
+        assert codes(items) == ["certificate_unusable"] and items[0].severity == "error"
+
+    def test_nothing_saved_needs_nothing(self) -> None:
+        assert onedrive_config_action_items({}) == []
+
+
+class TestRunActionItems:
+    """What a run leaves for the instance card; what SharePoint said stays until it says otherwise."""
+
+    async def test_a_secret_only_run_asks_to_switch(self, cloud, tenant, db, checkpoints) -> None:
+        inheritance_drive(tenant)
+        connector = await ready_connector(db, checkpoints)
+
+        await connector.run_sync()
+
+        assert codes(connector.last_action_items) == ["certificate_sign_in"]
+
+    async def test_a_working_certificate_leaves_nothing(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
+        inheritance_drive(tenant)
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
+        connector = await certificate_connector(db, checkpoints)
+
+        await connector.run_sync()
+
+        assert connector.last_action_items == []
+
+    async def test_a_refused_certificate_stays_on_the_card_through_quiet_runs_until_sharepoint_answers(
+        self, cloud, tenant, db, checkpoints, sharepoint_rest
+    ) -> None:
+        feed = inheritance_drive(tenant)
+        feed.by_token["D1"] = page([], delta_link=delta_link("u-ana", "D2"))
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
+        cloud.on("GET", LIST_REST, json_response({"error": {"message": {"value": "Unsupported app only token."}}}, status=401))
+        connector = await certificate_connector(db, checkpoints)
+        await connector.run_sync()
+        assert codes(connector.last_action_items) == ["sharepoint_refused"]
+
+        await connector.run_incremental_sync()
+        assert codes(connector.last_action_items) == ["sharepoint_refused"], "a run that didn't ask SharePoint knows nothing new"
+
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
+        feed.by_token["D2"] = page([changed("f1", "plan.pdf", INHERITING_UNIQUE_ID, 2, parent="d1")], delta_link=delta_link("u-ana", "D3"))
+        await connector.run_incremental_sync()
+        assert connector.last_action_items == []
+
+    async def test_a_missing_sharepoint_permission_is_named(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
+        inheritance_drive(tenant)
+        serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
+        cloud.on("GET", LIST_REST, json_response({"error": "denied"}, status=403))
+        connector = await certificate_connector(db, checkpoints)
+
+        await connector.run_sync()
+
+        assert codes(connector.last_action_items) == ["sharepoint_permission_missing"]
+        assert connector.last_action_items[0].severity == "error"

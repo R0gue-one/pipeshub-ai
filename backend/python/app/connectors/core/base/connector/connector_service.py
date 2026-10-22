@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 import asyncio
 from logging import Logger
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -65,6 +65,20 @@ class ConnectionCheckResult(BaseModel):
     message: str
 
 
+class ActionItem(BaseModel):
+    """Something the connector's admin has to do, shown on the instance card until it is done.
+
+    ``code`` identifies it for the connector; ``title`` and ``message`` are shown as written.
+    ``action`` names where in the panel it is done: ``authenticate`` opens the Authenticate tab.
+    """
+
+    code: str
+    severity: Literal["warning", "error"] = "warning"
+    title: str
+    message: str
+    action: Literal["authenticate"] | None = None
+
+
 class ConnectorSyncSkippedError(Exception):
     """Sync could not run now. Callers log ``code`` and treat the task as
     skipped, not crashed; nothing is persisted."""
@@ -124,6 +138,9 @@ class BaseConnector(ABC):
         # What the last run did, in the connector's own terms (counts, why it stopped); stored on
         # the app doc with the run's outcome so the UI can show it. Flat JSON values only.
         self.last_sync_summary: dict[str, object] | None = None
+        # What needs the admin's attention after the last run; stored on the app doc with the
+        # run's outcome, in the same write. None leaves what is stored as it is.
+        self.last_action_items: list[ActionItem] | None = None
         self.creator_email = None
         # Cached GROUP permission for the pseudo "ConnectorGroup" (see
         # ensure_connector_group_permission). Populated lazily by personal-scope
@@ -234,6 +251,24 @@ class BaseConnector(ABC):
 
         Connectors that override this get a connection check in the setup form."""
         raise NotImplementedError(f"{cls.__name__} has no connection check")
+
+    @classmethod
+    def auth_save_problem(
+        cls, auth_config: dict[str, Any], stored_auth_config: dict[str, Any] | None
+    ) -> str | None:
+        """Why these auth settings may not be saved, in words for the user; None when they may.
+
+        ``auth_config`` is what the save would store, laid over ``stored_auth_config``;
+        that is None while the instance is being created. Checked on the server for
+        every save, so a rule holds for API callers as well as the setup form."""
+        return None
+
+    @classmethod
+    def config_action_items(cls, auth_config: dict[str, Any]) -> list[ActionItem] | None:
+        """What needs the admin's attention in these saved auth settings, written when they are saved.
+
+        None (connectors that report none) leaves what is stored as it is."""
+        return None
 
     @classmethod
     def supports_connection_check(cls) -> bool:
