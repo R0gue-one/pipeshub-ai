@@ -157,6 +157,7 @@ PERMISSION_MODE_ITEM_ACL = "itemAcl"
 MAX_RECHECK_ITEMS = 1000
 # How long before a client certificate expires the instance card asks for a new one.
 CERTIFICATE_EXPIRY_WARNING = timedelta(days=30)
+CERTIFICATE_SETUP_DOCS_URL = "https://docs.pipeshub.com/connectors/microsoft-365/one-drive#switch-to-certificate-sign-in"
 # What SharePoint last said to the connector's certificate, kept so a run that never asks keeps the card as it was.
 SHAREPOINT_HEALTH_OK = "ok"
 SHAREPOINT_HEALTH_REFUSED = "refused"
@@ -332,12 +333,11 @@ def onedrive_config_action_items(auth_config: dict[str, Any], now: datetime | No
             code="certificate_sign_in",
             title="Switch to certificate sign-in",
             message=(
-                "This connector signs in with a client secret, so each file keeps a copy of the access OneDrive "
-                "reports for it. Upload a client certificate and its private key, and grant the app the "
-                "Sites.Read.All application permission of the SharePoint API: files and folders then inherit "
-                "their folder's access, so sharing changes reach everything inside a folder."
+                "Upload a client certificate and its private key, and grant the app the Sites.Read.All "
+                "application permission of the SharePoint API with admin consent."
             ),
             action="authenticate",
+            docs_url=CERTIFICATE_SETUP_DOCS_URL,
         )]
     problem = certificate_problem(auth_config)
     if problem:
@@ -347,6 +347,7 @@ def onedrive_config_action_items(auth_config: dict[str, Any], now: datetime | No
             title="The client certificate can't be used",
             message=problem,
             action="authenticate",
+            docs_url=CERTIFICATE_SETUP_DOCS_URL,
         )]
     expires = certificate_expiry(auth_config)
     if expires is not None and expires - now <= CERTIFICATE_EXPIRY_WARNING:
@@ -358,6 +359,7 @@ def onedrive_config_action_items(auth_config: dict[str, Any], now: datetime | No
                 "(Certificates & secrets) and upload it with its private key before then."
             ),
             action="authenticate",
+            docs_url=CERTIFICATE_SETUP_DOCS_URL,
         )]
     return []
 
@@ -466,9 +468,8 @@ ONEDRIVE_USER_FAILURE_NOTIFICATIONS: Dict[OneDriveUserStatus, Tuple[str, str]] =
                 placeholder="Click to upload certificate file (.crt, .cer, or .pem)",
                 description=(
                     "The certificate registered on the app (Certificates & secrets), with its private key below. "
-                    "Grant the app the Sites.Read.All application permission of the SharePoint API (not Microsoft "
-                    "Graph) too: files and folders then inherit their folder's access, so a change to a folder's "
-                    "sharing reaches everything inside it."
+                    "Also grant the app the Sites.Read.All application permission of the SharePoint API (not "
+                    "Microsoft Graph)."
                 ),
                 field_type="FILE",
                 required=True,
@@ -726,13 +727,14 @@ class OneDriveConnector(BaseConnector):
                 items.append(ActionItem(
                     code="sharepoint_refused",
                     severity="error",
-                    title="SharePoint rejected the client certificate",
+                    title="SharePoint refused the app",
                     message=(
-                        "Check that the certificate uploaded here is registered on the app (Certificates & secrets) "
-                        "and has not expired. Until then each item keeps its own access list, with no inheritance "
-                        "from its folder."
+                        "Grant the app the Sites.Read.All application permission of the SharePoint API with admin "
+                        "consent, and check that the certificate uploaded here is registered on the app and has "
+                        "not expired."
                     ),
                     action="authenticate",
+                    docs_url=CERTIFICATE_SETUP_DOCS_URL,
                 ))
             elif health == SHAREPOINT_HEALTH_FORBIDDEN:
                 items.append(ActionItem(
@@ -740,10 +742,10 @@ class OneDriveConnector(BaseConnector):
                     severity="error",
                     title="Grant the SharePoint permission",
                     message=(
-                        "SharePoint denied the app access to OneDrive sites. Grant the app the Sites.Read.All "
-                        "application permission of the SharePoint API (not Microsoft Graph) with admin consent. "
-                        "Until then each item keeps its own access list, with no inheritance from its folder."
+                        "Grant the app the Sites.Read.All application permission of the SharePoint API (not "
+                        "Microsoft Graph) with admin consent."
                     ),
+                    docs_url=CERTIFICATE_SETUP_DOCS_URL,
                 ))
             self.last_action_items = items
         except Exception as e:
@@ -770,9 +772,8 @@ class OneDriveConnector(BaseConnector):
                 title="OneDrive: switch to certificate sign-in",
                 message=(
                     "Recommended: upload a client certificate and its private key on the connector, and grant the "
-                    "app the Sites.Read.All application permission of the SharePoint API. Files and folders then "
-                    "inherit their folder's access, so a change to a folder's sharing reaches everything inside it; "
-                    "stored items are rewritten once. Until then nothing changes, and the client secret keeps working."
+                    "app the Sites.Read.All application permission of the SharePoint API. The connector page links "
+                    "to the steps."
                 ),
                 payload={
                     "connector_id": self.connector_id,
@@ -792,7 +793,8 @@ class OneDriveConnector(BaseConnector):
         self._sharepoint_refusal = str(error)
         self._sharepoint_health = SHAREPOINT_HEALTH_REFUSED
         self.logger.warning(
-            f"⚠️ SharePoint refused the connector's certificate sign-in, so for the rest of this run OneDrive items "
+            f"⚠️ SharePoint refused the app (no Sites.Read.All grant in its token, or a certificate it doesn't "
+            f"accept), so for the rest of this run OneDrive items "
             f"keep the access list OneDrive reports for each, with no inheritance from their folder: {error}"
         )
         await self.notify(
@@ -800,9 +802,9 @@ class OneDriveConnector(BaseConnector):
             severity=NotificationSeverity.WARNING,
             title="OneDrive can't read inherited permissions",
             message=(
-                "SharePoint rejected the connector's client certificate. Check that the certificate uploaded to the "
-                "connector is registered on the app (Certificates & secrets) and has not expired. Until then, each "
-                "item keeps the access list OneDrive reports for it, with no inheritance from its folder."
+                "SharePoint refused the app. Grant it the Sites.Read.All application permission of the SharePoint "
+                "API with admin consent, and check that the certificate uploaded to the connector is registered on "
+                "the app and has not expired."
             ),
             payload={
                 "connector_id": self.connector_id,
@@ -819,8 +821,7 @@ class OneDriveConnector(BaseConnector):
             title="OneDrive can't read inherited permissions",
             message=(
                 "SharePoint denied the app access to OneDrive sites. Grant the app the Sites.Read.All application "
-                "permission of the SharePoint API (not Microsoft Graph) with admin consent. Until then, each item "
-                "keeps the access list OneDrive reports for it, with no inheritance from its folder."
+                "permission of the SharePoint API (not Microsoft Graph) with admin consent."
             ),
             payload={
                 "connector_id": self.connector_id,
@@ -3286,8 +3287,8 @@ class OneDriveConnector(BaseConnector):
         return ConnectionCheckResult(
             success=True,
             message=(
-                "Signed in. Upload a client certificate and grant the SharePoint Sites.Read.All application "
-                "permission to have files and folders inherit their folder's access."
+                "Signed in. Recommended: upload a client certificate and grant the app the SharePoint API's "
+                "Sites.Read.All application permission."
             ),
         )
 

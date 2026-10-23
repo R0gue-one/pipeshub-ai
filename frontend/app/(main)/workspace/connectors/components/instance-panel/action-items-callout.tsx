@@ -38,6 +38,18 @@ export function ActionItemsCallout({
             <Text size="1" style={{ color: 'var(--gray-11)' }}>
               {item.message}
             </Text>
+            {item.docsUrl && /^https:\/\//i.test(item.docsUrl) ? (
+              <Text size="1">
+                <a
+                  href={item.docsUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style={{ color: 'var(--accent-11)', textDecoration: 'underline' }}
+                >
+                  {t('workspace.connectors.actionItems.viewSteps')}
+                </a>
+              </Text>
+            ) : null}
           </Flex>
         ))}
         {needsAuthentication && onOpenAuthentication ? (

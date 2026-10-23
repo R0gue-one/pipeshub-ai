@@ -168,7 +168,8 @@ async def test_what_the_admin_has_to_do_is_stored_with_the_outcome() -> None:
 
     async def reports_an_item() -> None:
         connector.last_action_items = [
-            ActionItem(code="certificate_sign_in", title="Switch", message="Upload a certificate", action="authenticate")
+            ActionItem(code="certificate_sign_in", title="Switch", message="Upload a certificate", action="authenticate",
+                       docs_url="https://docs.example.com/steps")
         ]
 
     connector = _connector(reports_an_item)
@@ -177,7 +178,7 @@ async def test_what_the_admin_has_to_do_is_stored_with_the_outcome() -> None:
 
     assert json.loads(_idle_write(gp)[Keys.ACTION_ITEMS]) == [{
         "code": "certificate_sign_in", "severity": "warning", "title": "Switch",
-        "message": "Upload a certificate", "action": "authenticate",
+        "message": "Upload a certificate", "action": "authenticate", "docsUrl": "https://docs.example.com/steps",
     }]
 
 

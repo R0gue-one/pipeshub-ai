@@ -2604,7 +2604,8 @@
         "errorFallback": "無法停用連接器。請再試一次。",
         "actions": {
           "removeInstance": "移除此連接器執行個體",
-          "saveConfig": "儲存設定變更"
+          "saveConfig": "儲存設定變更",
+          "saveAuth": "儲存新的認證資訊"
         }
       },
       "adminAccessDialog": {
@@ -3056,7 +3057,8 @@
       "actionItems": {
         "badge": "需要處理",
         "title": "需要處理",
-        "openAuthentication": "更新驗證"
+        "openAuthentication": "更新驗證",
+        "viewSteps": "查看設定步驟"
       }
     },
     "mcpServers": {

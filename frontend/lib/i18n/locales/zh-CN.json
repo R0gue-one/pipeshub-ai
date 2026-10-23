@@ -2604,7 +2604,8 @@
         "errorFallback": "禁用连接器失败。请重试。",
         "actions": {
           "removeInstance": "移除此连接器实例",
-          "saveConfig": "保存配置更改"
+          "saveConfig": "保存配置更改",
+          "saveAuth": "保存新的凭据"
         }
       },
       "adminAccessDialog": {
@@ -3056,7 +3057,8 @@
       "actionItems": {
         "badge": "需要处理",
         "title": "需要处理",
-        "openAuthentication": "更新身份验证"
+        "openAuthentication": "更新身份验证",
+        "viewSteps": "查看设置步骤"
       }
     },
     "mcpServers": {

@@ -202,6 +202,8 @@ export interface ConnectorActionItem {
   message: string;
   /** Where in the panel it is done: `authenticate` opens the Authenticate tab. */
   action?: 'authenticate' | null;
+  /** The steps, on the docs site. */
+  docsUrl?: string | null;
 }
 
 export interface SyncCustomField {

@@ -236,7 +236,7 @@ async def _finalize(
     if isinstance(action_items, list):
         # Text, as the summary is; None when nothing is left to do, which clears the card's badge.
         ended[ConnectorStateKeys.ACTION_ITEMS] = (
-            json.dumps([item.model_dump() for item in action_items]) if action_items else None
+            json.dumps([item.model_dump(by_alias=True) for item in action_items]) if action_items else None
         )
     if full_sync_cut_short:
         logger.warning(

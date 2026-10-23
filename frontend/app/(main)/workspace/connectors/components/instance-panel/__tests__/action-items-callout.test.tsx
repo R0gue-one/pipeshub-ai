@@ -44,6 +44,23 @@ describe('ActionItemsCallout', () => {
     expect(screen.queryByRole('button', { name: 'Update authentication' })).toBeNull();
   });
 
+  it('links to the steps when the connector gives them', () => {
+    const withSteps = { ...SWITCH, docsUrl: 'https://docs.pipeshub.com/connectors/microsoft-365/one-drive#switch-to-certificate-sign-in' };
+    renderInTheme(<ActionItemsCallout instance={makeInstance({ actionItems: [withSteps] })} />);
+
+    const link = screen.getByRole('link', { name: 'View setup steps' });
+    expect(link.getAttribute('href')).toBe(withSteps.docsUrl);
+    expect(link.getAttribute('target')).toBe('_blank');
+    expect(link.getAttribute('rel')).toContain('noopener');
+  });
+
+  it('shows no link that is not https', () => {
+    const scripted = { ...SWITCH, docsUrl: 'javascript:alert(1)' };
+    renderInTheme(<ActionItemsCallout instance={makeInstance({ actionItems: [scripted] })} />);
+
+    expect(screen.queryByRole('link')).toBeNull();
+  });
+
   it('renders nothing when there is nothing to do', () => {
     const { container } = renderInTheme(<ActionItemsCallout instance={makeInstance({ actionItems: [] })} />);
 

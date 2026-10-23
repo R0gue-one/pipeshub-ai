@@ -2614,7 +2614,8 @@
         "errorFallback": "Failed to disable connector. Please try again.",
         "actions": {
           "removeInstance": "remove this connector instance",
-          "saveConfig": "save configuration changes"
+          "saveConfig": "save configuration changes",
+          "saveAuth": "save the new credentials"
         }
       },
       "adminAccessDialog": {
@@ -3066,7 +3067,8 @@
       "actionItems": {
         "badge": "Action needed",
         "title": "Action needed",
-        "openAuthentication": "Update authentication"
+        "openAuthentication": "Update authentication",
+        "viewSteps": "View setup steps"
       }
     },
     "mcpServers": {

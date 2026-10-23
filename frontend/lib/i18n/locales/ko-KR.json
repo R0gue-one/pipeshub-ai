@@ -2604,7 +2604,8 @@
         "errorFallback": "커넥터를 비활성화하지 못했습니다. 다시 시도해 주세요.",
         "actions": {
           "removeInstance": "이 커넥터 인스턴스를 제거",
-          "saveConfig": "설정 변경 사항을 저장"
+          "saveConfig": "설정 변경 사항을 저장",
+          "saveAuth": "새 자격 증명을 저장"
         }
       },
       "adminAccessDialog": {
@@ -3056,7 +3057,8 @@
       "actionItems": {
         "badge": "조치 필요",
         "title": "조치 필요",
-        "openAuthentication": "인증 업데이트"
+        "openAuthentication": "인증 업데이트",
+        "viewSteps": "설정 단계 보기"
       }
     },
     "mcpServers": {

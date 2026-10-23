@@ -8600,7 +8600,7 @@ async def _store_config_action_items(
         await request.app.state.graph_provider.update_node(
             connector_id,
             CollectionNames.APPS.value,
-            {ConnectorStateKeys.ACTION_ITEMS: json.dumps([item.model_dump() for item in items]) if items else None},
+            {ConnectorStateKeys.ACTION_ITEMS: json.dumps([item.model_dump(by_alias=True) for item in items]) if items else None},
         )
     except Exception as e:
         logger.warning("Could not refresh the action items of connector %s: %s", connector_id, e)

@@ -1839,11 +1839,11 @@ class TestConnectionCheck:
     async def check(self, auth: dict[str, Any]) -> ConnectionCheckResult:
         return await OneDriveConnector.check_connection(auth, logging.getLogger("test.onedrive.check"))
 
-    async def test_a_working_secret_passes_and_says_what_a_certificate_adds(self, cloud) -> None:
+    async def test_a_working_secret_passes_and_recommends_a_certificate(self, cloud) -> None:
         result = await self.check(self.auth())
 
         assert result.success is True
-        assert "Upload a client certificate" in result.message
+        assert "upload a client certificate" in result.message and "Sites.Read.All" in result.message
         assert not [r for r in cloud.requests if r.url.host.endswith("sharepoint.com")]
 
     async def test_a_rejected_secret_is_named(self, cloud) -> None:
@@ -2400,7 +2400,8 @@ class TestCertificateSuggestion:
 
         sent = suggestions(await notes(connector))
         assert len(sent) == 1, "a scheduled (incremental) run reminds too, but not on every run"
-        assert "Recommended" in sent[0]["message"] and "client secret keeps working" in sent[0]["message"]
+        assert "Recommended" in sent[0]["message"] and "Sites.Read.All" in sent[0]["message"]
+        assert "inherit" not in sent[0]["message"], "it says what to do, not how inheritance works"
         assert sent[0]["recipient_user_ids"] == ["creator-1"]
 
     async def test_a_week_later_it_reminds_again(self, cloud, tenant, db, checkpoints) -> None:
@@ -2664,6 +2665,8 @@ class TestConfigActionItems:
 
         assert codes(items) == ["certificate_sign_in"] and items[0].action == "authenticate"
         assert items[0].severity == "warning"
+        assert items[0].docs_url is not None and items[0].docs_url.endswith("#switch-to-certificate-sign-in")
+        assert items[0].model_dump(by_alias=True)["docsUrl"] == items[0].docs_url, "stored as the UI reads it"
 
     def test_a_usable_certificate_needs_nothing(self) -> None:
         assert onedrive_config_action_items({"certificate": CERTIFICATE, "privateKey": PRIVATE_KEY}) == []

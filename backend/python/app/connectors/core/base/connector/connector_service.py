@@ -4,7 +4,7 @@ from logging import Logger
 from typing import Any, Dict, List, Literal, Optional
 
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.config.configuration_service import ConfigurationService
 from app.config.constants.arangodb import Connectors
@@ -70,6 +70,7 @@ class ActionItem(BaseModel):
 
     ``code`` identifies it for the connector; ``title`` and ``message`` are shown as written.
     ``action`` names where in the panel it is done: ``authenticate`` opens the Authenticate tab.
+    ``docs_url`` links to the steps; stored as ``docsUrl``, so dump with ``by_alias=True``.
     """
 
     code: str
@@ -77,6 +78,7 @@ class ActionItem(BaseModel):
     title: str
     message: str
     action: Literal["authenticate"] | None = None
+    docs_url: str | None = Field(default=None, serialization_alias="docsUrl")
 
 
 class ConnectorSyncSkippedError(Exception):

@@ -2688,7 +2688,8 @@
         "errorFallback": "Konektor se nepodařilo zakázat. Zkuste to prosím znovu.",
         "actions": {
           "removeInstance": "odebrat tuto instanci konektoru",
-          "saveConfig": "uložit změny konfigurace"
+          "saveConfig": "uložit změny konfigurace",
+          "saveAuth": "uložit nové přihlašovací údaje"
         }
       },
       "adminAccessDialog": {
@@ -3140,7 +3141,8 @@
       "actionItems": {
         "badge": "Vyžaduje akci",
         "title": "Vyžaduje akci",
-        "openAuthentication": "Aktualizovat ověření"
+        "openAuthentication": "Aktualizovat ověření",
+        "viewSteps": "Zobrazit postup nastavení"
       }
     },
     "mcpServers": {

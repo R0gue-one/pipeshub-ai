@@ -178,7 +178,9 @@ class TestActionItemsOnSave:
 
         connector_id, collection, update = request.app.state.graph_provider.update_node.await_args.args
         assert (connector_id, collection) == ("c1", "apps")
-        assert [item["code"] for item in json.loads(update["actionItems"])] == ["certificate_sign_in"]
+        stored = json.loads(update["actionItems"])
+        assert [item["code"] for item in stored] == ["certificate_sign_in"]
+        assert stored[0]["docsUrl"].startswith("https://docs.pipeshub.com/"), "camelCase, as the UI reads it"
 
     async def test_fixing_the_auth_clears_them(self) -> None:
         request = self.save_request()

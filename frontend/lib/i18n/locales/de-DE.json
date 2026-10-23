@@ -2468,7 +2468,8 @@
         "errorFallback": "Konnektor konnte nicht deaktiviert werden. Bitte versuchen Sie es erneut.",
         "actions": {
           "removeInstance": "diese Konnektor-Instanz zu entfernen",
-          "saveConfig": "Konfigurationsänderungen zu speichern"
+          "saveConfig": "Konfigurationsänderungen zu speichern",
+          "saveAuth": "die neuen Anmeldedaten zu speichern"
         }
       },
       "adminAccessDialog": {
@@ -2920,7 +2921,8 @@
       "actionItems": {
         "badge": "Handlung erforderlich",
         "title": "Handlung erforderlich",
-        "openAuthentication": "Authentifizierung aktualisieren"
+        "openAuthentication": "Authentifizierung aktualisieren",
+        "viewSteps": "Einrichtungsschritte ansehen"
       }
     },
     "mcpServers": {

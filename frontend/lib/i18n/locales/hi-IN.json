@@ -2463,7 +2463,8 @@
         "errorFallback": "कनेक्टर को अक्षम नहीं किया जा सका। कृपया पुनः प्रयास करें।",
         "actions": {
           "removeInstance": "इस कनेक्टर इंस्टेंस को हटाना",
-          "saveConfig": "कॉन्फ़िगरेशन परिवर्तन सहेजना"
+          "saveConfig": "कॉन्फ़िगरेशन परिवर्तन सहेजना",
+          "saveAuth": "नए क्रेडेंशियल सहेजना"
         }
       },
       "adminAccessDialog": {
@@ -2915,7 +2916,8 @@
       "actionItems": {
         "badge": "कार्रवाई आवश्यक",
         "title": "कार्रवाई आवश्यक",
-        "openAuthentication": "प्रमाणीकरण अपडेट करें"
+        "openAuthentication": "प्रमाणीकरण अपडेट करें",
+        "viewSteps": "सेटअप के चरण देखें"
       }
     },
     "mcpServers": {

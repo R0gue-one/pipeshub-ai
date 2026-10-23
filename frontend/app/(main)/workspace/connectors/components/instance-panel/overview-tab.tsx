@@ -62,6 +62,7 @@ export function OverviewTab({
   const router = useRouter();
   const closeInstancePanel = useConnectorsStore((s) => s.closeInstancePanel);
   const openPanel = useConnectorsStore((s) => s.openPanel);
+  const setPanelActiveTab = useConnectorsStore((s) => s.setPanelActiveTab);
   const instanceConfigs = useConnectorsStore((s) => s.instanceConfigs);
   const setLocalSyncStatus = useConnectorsStore((s) => s.setLocalSyncStatus);
   const addToast = useToastStore((s) => s.addToast);
@@ -282,9 +283,10 @@ export function OverviewTab({
       <ActionItemsCallout
         instance={instance}
         onOpenAuthentication={() => {
-          // The settings panel opens on its Authenticate tab.
           closeInstancePanel();
           openPanel(instance, instance._key, instance.scope === 'personal' ? 'personal' : 'team');
+          // openPanel picks Configure for an authenticated connector; the fix is on Authenticate.
+          setPanelActiveTab('authenticate');
         }}
       />
 
