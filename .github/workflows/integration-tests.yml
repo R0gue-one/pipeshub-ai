@@ -378,11 +378,11 @@ jobs:
       # shard may reach the real Microsoft 365: the live sharepoint suite (shard 1) and outlook (shard 2) stay off it.
       # The onedrive_sim suite runs against the same simulator and front: its OneDrive routes answer the same
       # Microsoft host names, so it shares the shard and every setting here.
-      # Its own pin and image: CONNSIM_SHAREPOINT_REF is connectors-simulator's sim/onedrive branch, which is its
-      # main with the SharePoint simulator (#7) plus the OneDrive routes, not merged yet; move it to main once they
+      # Its own pin and image: CONNSIM_SHAREPOINT_REF is connectors-simulator's sim/onedrive branch: its main as of
+      # 424e407 (the SharePoint simulator, #7) plus the OneDrive routes, not merged yet; move it to main once they
       # are. CONNSIM_REF is still the integration/notion-gmail branch, which has Confluence changes main lacks.
       # One pin will do once both branches are on main.
-      CONNSIM_SHAREPOINT_REF: 13f6532f901d5d9f8a061ab8be527ca472fb2be0
+      CONNSIM_SHAREPOINT_REF: d2cbf3901c123f39d2951d7d0c0bcdc571c3770e
       SHAREPOINT_SIM_IMAGE: pipeshub/connectors-simulator:sharepoint-it
       NEEDS_SHAREPOINT_SIM: ${{ (matrix.shard == 'connectors-3' || (matrix.shard == 'dispatch' && (github.event.inputs.connectors == 'sharepoint_sim' || github.event.inputs.connectors == 'onedrive_sim'))) && 'true' || 'false' }}
       SHAREPOINT_TEST_SITE_NAMES: ${{ secrets.SHAREPOINT_TEST_SITE_NAMES }}

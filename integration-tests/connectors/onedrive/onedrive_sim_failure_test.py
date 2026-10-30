@@ -92,8 +92,14 @@ class TestOneDriveSimFailures:
         w = onedrive_world
         tenant = base_tenant(app={"graph_roles": ["Files.Read.All", "User.Read.All", "Group.Read.All",
                                                   "Sites.FullControl.All"], "sharepoint_roles": ["Sites.Read.All"]})
-        tenant["users"] = [u for u in tenant["users"] if u["key"] not in ("frank", "gina")]
+        # Every tenant user with a PipesHub account has a OneDrive that opens: frank (none), gina (locked) and
+        # the guest gus (none; another test may have given him an account) go, and hank and hal, who have none
+        # in the base tenant, get an empty one. Each of those cases is a notice of its own.
+        tenant["users"] = [u for u in tenant["users"] if u["key"] not in ("frank", "gina", "gus")]
         tenant["onedrives"] = [o for o in tenant["onedrives"] if o["user"] != "gina"]
+        tenant["onedrives"] += [{"user": "hank"}, {"user": "hal"}]
+        alice = next(o for o in tenant["onedrives"] if o["user"] == "alice")
+        alice["tree"] = [i for i in alice["tree"] if i.get("key") != "a-guest"]  # shared with gus
         await w.start(tenant)
         for _ in range(2):
             assert succeeded(await w.sync())
