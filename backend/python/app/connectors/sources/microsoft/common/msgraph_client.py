@@ -17,6 +17,7 @@ from msgraph.generated.models.base_delta_function_response import (
 from msgraph.generated.models.drive import Drive
 from msgraph.generated.models.drive_item import DriveItem
 from msgraph.generated.models.group import Group
+from msgraph.generated.models.list_item_collection_response import ListItemCollectionResponse
 from msgraph.generated.models.o_data_errors.o_data_error import ODataError
 from msgraph.generated.models.search_response import SearchResponse
 from msgraph.generated.users.users_request_builder import UsersRequestBuilder
@@ -568,6 +569,48 @@ class MSGraphClient:
             if raise_on_error:
                 raise
             return []
+
+    async def list_drive_shortcuts(self, drive_id: str) -> List[Dict[str, Any]]:
+        """The "Add shortcut to My files" shortcuts in a drive: [{"drive_id", "item_id", "drive_type", "is_folder"}]
+        of what each points to.
+
+        Graph leaves shortcuts out of a drive's delta and children for an app token; the drive's list items show
+        them (live probe, 2026-10-30). Raises when any page can't be read: a partial answer would read as
+        shortcuts removed.
+        """
+        shortcuts: List[Dict[str, Any]] = []
+        base = self.client.request_adapter.base_url.rstrip("/")
+        url: Optional[str] = f"{base}/drives/{drive_id}/list/items?$select=id&$expand=driveItem($select=id,name,remoteItem)"
+        while url:
+            # Set as the URL, not a template: template expansion drops the commas of the nested $select, in this
+            # URL and in Graph's nextLink, which repeats it.
+            request_info = RequestInformation()
+            request_info.http_method = Method.GET
+            request_info.url = url
+            async with self.rate_limiter:
+                result = await self.client.request_adapter.send_async(
+                    request_info=request_info,
+                    parsable_factory=ListItemCollectionResponse,
+                    error_map={"4XX": ODataError, "5XX": ODataError},
+                )
+            for row in (result.value or []) if result else []:
+                remote = getattr(getattr(row, "drive_item", None), "remote_item", None)
+                parent = getattr(remote, "parent_reference", None)
+                if remote is None or not remote.id or parent is None or not parent.drive_id:
+                    continue
+                shortcuts.append({"drive_id": parent.drive_id, "item_id": remote.id,
+                                  "drive_type": parent.drive_type, "is_folder": remote.folder is not None})
+            url = getattr(result, "odata_next_link", None) if result else None
+        return shortcuts
+
+    async def get_drive_item(self, drive_id: str, item_id: str) -> Optional[DriveItem]:
+        """One item; ODataError (404 when it is gone) is raised to the caller."""
+        async with self.rate_limiter:
+            return await self.client.drives.by_drive_id(drive_id).items.by_drive_item_id(item_id).get()
+
+    async def get_drive(self, drive_id: str) -> Optional[Drive]:
+        async with self.rate_limiter:
+            return await self.client.drives.by_drive_id(drive_id).get()
 
     async def list_folder_children(
         self, drive_id: str, folder_id: str, *, raise_on_error: bool = False

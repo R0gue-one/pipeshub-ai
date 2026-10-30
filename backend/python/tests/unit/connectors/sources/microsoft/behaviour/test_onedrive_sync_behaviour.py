@@ -165,6 +165,8 @@ class Tenant:
         drive = f"drive-{user_id.removeprefix('u-')}"
         self.cloud.on("GET", f"/v1.0/users/{user_id}/drive", {"id": drive, "webUrl": f"https://acme-my.sharepoint.com/personal/{user_id}"})
         self.cloud.on("GET", f"/v1.0/users/{user_id}", {"id": user_id, "mail": email, "userPrincipalName": email, "displayName": name})
+        # No shortcuts ("Add shortcut to My files") unless a test adds some.
+        self.cloud.on("GET", f"/v1.0/drives/{drive}/list/items", page([]))
         feed = TokenFeed()
         self.drive_delta[user_id] = feed
         self.cloud.on("GET", f"/v1.0/users/{user_id}/drive/root/delta", feed)
@@ -3327,3 +3329,184 @@ class TestFilesReadAllProbe:
 
         listings = [MicrosoftCloudStub.query(r) for r in cloud.calls("GET", "/v1.0/users")]
         assert {"$top": "10", "$select": "id"} in listings
+
+
+HOUR_MS = 60 * 60 * 1000
+SAM_DRIVE = "drive-sam"
+
+
+def shortcut_row(row_id: str, target: str, drive: str = SAM_DRIVE, drive_type: str = "business") -> dict[str, Any]:
+    """A list item of the holder's drive that is a shortcut: its driveItem carries remoteItem (live probe, 2026-10-30)."""
+    return {"id": row_id, "driveItem": {"id": f"sc-{target}", "name": f"Sam - {target}", "remoteItem": {
+        "id": target, "folder": {"childCount": 1}, "parentReference": {"driveId": drive, "driveType": drive_type}}}}
+
+
+class Clock:
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.now = 1_800_000_000_000
+        monkeypatch.setattr(f"{MODULE}.get_epoch_timestamp_in_ms", lambda: self.now)
+
+
+class TestFoldersAddedAsShortcuts:
+    """A colleague who is not synced (Sam) shares folder s1 with Ana, who adds it to her OneDrive as a shortcut.
+    Graph shows the shortcut only in her drive's list items, never in its delta."""
+
+    def _sam(self, cloud: MicrosoftCloudStub, tenant: Tenant, *, rows: list[dict[str, Any]] | None = None) -> None:
+        feed = tenant.add_user("u-ana", "ana@acme.com", "Ana")
+        feed.by_token[None] = page([drive_item("a1", "mine.pdf")], delta_link=delta_link("u-ana", "D1"))
+        cloud.on("GET", f"/v1.0/drives/{DRIVE}/list/items", page(rows if rows is not None else [shortcut_row("7", "s1")]))
+        cloud.on("GET", f"/v1.0/drives/{SAM_DRIVE}", {"id": SAM_DRIVE, "webUrl": "https://acme-my.sharepoint.com/personal/sam",
+                                                    "owner": {"user": {"id": "u-sam", "displayName": "Sam"}}})
+        cloud.on("GET", f"/v1.0/drives/{SAM_DRIVE}/items/s1", drive_item("s1", "Team", folder=True, drive=SAM_DRIVE, parent="root-sam"))
+        self.children(cloud, [drive_item("f9", "notes.pdf", parent="s1", drive=SAM_DRIVE)])
+        grants = [user_grant("u-sam", "sam@acme.com", "owner"), user_grant("u-ana", "ana@acme.com")]
+        tenant.share("s1", grants, drive=SAM_DRIVE)
+        tenant.share("f9", grants, drive=SAM_DRIVE)
+
+    @staticmethod
+    def children(cloud: MicrosoftCloudStub, items: list[dict[str, Any]]) -> None:
+        cloud.on("GET", f"/v1.0/drives/{SAM_DRIVE}/items/s1/children", page(items))
+
+    async def test_a_folder_added_as_a_shortcut_is_synced_with_its_own_access(self, cloud, tenant, db, checkpoints, monkeypatch) -> None:
+        Clock(monkeypatch)
+        self._sam(cloud, tenant)
+        connector = await ready_connector(db, checkpoints)
+
+        await connector.run_sync()
+
+        assert db.records["s1"].external_record_group_id == SAM_DRIVE
+        assert db.records["s1"].parent_external_record_id is None
+        assert db.records["s1"].inherit_permissions is False
+        assert db.records["f9"].parent_external_record_id == "s1"
+        assert (EntityType.USER, "u-ana", "ana@acme.com", PermissionType.READ) in perms(db, "f9")
+        group, grants = db.record_group_writes[-1]
+        assert (group.external_group_id, group.name, grants) == (SAM_DRIVE, "Sam's OneDrive", None)
+        assert "sc-s1" not in db.records
+        listing = cloud.calls("GET", f"/v1.0/drives/{DRIVE}/list/items")[0]
+        assert MicrosoftCloudStub.query(listing)["$expand"] == "driveItem($select=id,name,remoteItem)"
+
+    async def test_every_page_of_a_drives_list_items_is_read(self, cloud, tenant, db, checkpoints, monkeypatch) -> None:
+        Clock(monkeypatch)
+        self._sam(cloud, tenant)
+        nxt = f"{GRAPH}/drives/{DRIVE}/list/items?$select=id&$expand=driveItem($select=id,name,remoteItem)&$skiptoken=2"
+        cloud.on("GET", f"/v1.0/drives/{DRIVE}/list/items", lambda r: json_response(
+            page([shortcut_row("7", "s1")]) if "$skiptoken" in MicrosoftCloudStub.query(r)
+            else {"value": [{"id": "1", "driveItem": {"id": "a1", "name": "mine.pdf"}}], "@odata.nextLink": nxt}))
+        connector = await ready_connector(db, checkpoints)
+
+        await connector.run_sync()
+
+        assert "f9" in db.records
+        second = cloud.calls("GET", f"/v1.0/drives/{DRIVE}/list/items")[1]
+        assert MicrosoftCloudStub.query(second)["$expand"] == "driveItem($select=id,name,remoteItem)"
+
+    async def test_shortcuts_are_looked_for_and_read_at_most_once_an_hour(self, cloud, tenant, db, checkpoints, monkeypatch) -> None:
+        clock = Clock(monkeypatch)
+        self._sam(cloud, tenant)
+        connector = await ready_connector(db, checkpoints)
+        await connector.run_sync()
+
+        await connector.run_sync()
+        assert len(cloud.calls("GET", f"/v1.0/drives/{DRIVE}/list/items")) == 1
+        assert len(cloud.calls("GET", f"/v1.0/drives/{SAM_DRIVE}/items/s1/children")) == 1
+
+        clock.now += HOUR_MS
+        await connector.run_sync()
+        assert len(cloud.calls("GET", f"/v1.0/drives/{DRIVE}/list/items")) == 2
+        assert len(cloud.calls("GET", f"/v1.0/drives/{SAM_DRIVE}/items/s1/children")) == 2
+
+    async def test_a_full_sync_reads_shortcuts_whatever_the_hour(self, cloud, tenant, db, checkpoints, monkeypatch) -> None:
+        Clock(monkeypatch)
+        self._sam(cloud, tenant)
+        connector = await ready_connector(db, checkpoints)
+        await connector.run_sync()
+        db.full_sync = True
+
+        await connector.run_sync()
+
+        assert len(cloud.calls("GET", f"/v1.0/drives/{SAM_DRIVE}/items/s1/children")) == 2
+
+    async def test_a_removed_shortcut_takes_the_folder_out(self, cloud, tenant, db, checkpoints, monkeypatch) -> None:
+        clock = Clock(monkeypatch)
+        self._sam(cloud, tenant)
+        connector = await ready_connector(db, checkpoints)
+        await connector.run_sync()
+        assert "f9" in db.records
+        cloud.on("GET", f"/v1.0/drives/{DRIVE}/list/items", page([]))
+        clock.now += HOUR_MS
+
+        await connector.run_sync()
+
+        assert "s1" not in db.records and "f9" not in db.records
+        assert SAM_DRIVE not in db.record_groups
+        assert "a1" in db.records
+
+    async def test_a_shared_folder_that_is_gone_is_removed(self, cloud, tenant, db, checkpoints, monkeypatch) -> None:
+        clock = Clock(monkeypatch)
+        self._sam(cloud, tenant)
+        connector = await ready_connector(db, checkpoints)
+        await connector.run_sync()
+        assert "f9" in db.records
+        cloud.on("GET", f"/v1.0/drives/{SAM_DRIVE}/items/s1", graph_error(404, "itemNotFound"))
+        clock.now += HOUR_MS
+
+        await connector.run_sync()
+
+        assert "s1" not in db.records and "f9" not in db.records
+
+    async def test_a_file_no_longer_in_the_shared_folder_leaves(self, cloud, tenant, db, checkpoints, monkeypatch) -> None:
+        clock = Clock(monkeypatch)
+        self._sam(cloud, tenant)
+        connector = await ready_connector(db, checkpoints)
+        await connector.run_sync()
+        self.children(cloud, [])
+        clock.now += HOUR_MS
+
+        await connector.run_sync()
+
+        assert "s1" in db.records and "f9" not in db.records
+
+    async def test_access_taken_away_inside_the_shared_folder_is_written(self, cloud, tenant, db, checkpoints, monkeypatch) -> None:
+        clock = Clock(monkeypatch)
+        self._sam(cloud, tenant)
+        connector = await ready_connector(db, checkpoints)
+        await connector.run_sync()
+        tenant.share("f9", [user_grant("u-sam", "sam@acme.com", "owner")], drive=SAM_DRIVE)
+        clock.now += HOUR_MS
+
+        await connector.run_sync()
+
+        assert (EntityType.USER, "u-ana", "ana@acme.com", PermissionType.READ) not in perms(db, "f9")
+
+    async def test_a_shortcut_to_a_sharepoint_library_is_left_to_the_sharepoint_connector(self, cloud, tenant, db, checkpoints, monkeypatch) -> None:
+        Clock(monkeypatch)
+        self._sam(cloud, tenant, rows=[shortcut_row("7", "s1", drive_type="documentLibrary")])
+        connector = await ready_connector(db, checkpoints)
+
+        await connector.run_sync()
+
+        assert "s1" not in db.records
+        assert cloud.calls("GET", f"/v1.0/drives/{SAM_DRIVE}/items/s1") == []
+
+    async def test_a_folder_whose_owner_is_synced_comes_from_their_own_drive(self, cloud, tenant, db, checkpoints, monkeypatch) -> None:
+        Clock(monkeypatch)
+        self._sam(cloud, tenant)
+        sam = tenant.add_user("u-sam", "sam@acme.com", "Sam")
+        sam.by_token[None] = page([], delta_link=delta_link("u-sam", "S1"))
+        connector = await ready_connector(db, checkpoints)
+
+        await connector.run_sync()
+
+        assert cloud.calls("GET", f"/v1.0/drives/{SAM_DRIVE}/items/s1/children") == []
+
+    async def test_shortcuts_that_cannot_be_listed_keep_the_folder_and_fail_the_run(self, cloud, tenant, db, checkpoints, monkeypatch) -> None:
+        clock = Clock(monkeypatch)
+        self._sam(cloud, tenant)
+        connector = await ready_connector(db, checkpoints)
+        await connector.run_sync()
+        cloud.on("GET", f"/v1.0/drives/{DRIVE}/list/items", graph_error(503, "serviceNotAvailable"))
+        clock.now += HOUR_MS
+
+        await incomplete_run(connector)
+
+        assert "s1" in db.records and "f9" in db.records

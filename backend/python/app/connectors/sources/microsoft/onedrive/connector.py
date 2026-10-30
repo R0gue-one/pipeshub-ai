@@ -83,6 +83,11 @@ from app.connectors.sources.microsoft.onedrive.group_nesting import GroupNesting
 from app.connectors.sources.microsoft.onedrive.folder_access import FolderAccess
 from app.connectors.sources.microsoft.onedrive.notices import OneDriveNotices
 from app.connectors.sources.microsoft.onedrive.run_health import RunHealth
+from app.connectors.sources.microsoft.onedrive.shortcuts import (
+    FOLLOWED_DRIVE_TYPES,
+    SharedFolder,
+    ShortcutRegistry,
+)
 from app.connectors.sources.microsoft.sharepoint_online.drive_reconciler import DriveReconciler
 from app.connectors.sources.google.drive.team.user_status import UserStatusTracker
 from app.connectors.sources.microsoft.common.sharepoint_permission_scope import (
@@ -642,6 +647,11 @@ class OneDriveConnector(BaseConnector):
             lambda data: self.drive_delta_sync_point.update_sync_point(drives_key, data),
         )
         self._folder_access: dict[str, FolderAccess] = {}
+        shortcuts_key = generate_record_sync_point_key("sharedFolders", "connector", "shortcuts")
+        self._shortcuts = ShortcutRegistry(
+            lambda: self.drive_delta_sync_point.read_sync_point(shortcuts_key),
+            lambda data: self.drive_delta_sync_point.update_sync_point(shortcuts_key, data),
+        )
         self._nesting = GroupNesting(
             lambda: self.user_group_sync_point.read_sync_point(self._groups_sync_point_key()),
             lambda data: self.user_group_sync_point.update_sync_point(self._groups_sync_point_key(), data),
@@ -944,9 +954,13 @@ class OneDriveConnector(BaseConnector):
         *,
         hold_page_on_incomplete_walk: bool = True,
         unresolved_access: list[str] | None = None,
+        shared_folder_root: bool = False,
     ) -> Optional[RecordUpdate]:
         """
         Process a single delta item and detect changes.
+
+        ``shared_folder_root``: the top of a folder synced through a shortcut. Its parent is not synced, so it
+        hangs off its drive and keeps its own access even where OneDrive says it inherits.
 
         Returns:
             RecordUpdate object containing the record and change information
@@ -1042,7 +1056,9 @@ class OneDriveConnector(BaseConnector):
                 weburl=item.web_url,
                 is_shared=is_shared,
                 mime_type=item.file.mime_type if item.file else MimeTypes.FOLDER.value,
-                parent_external_record_id=item.parent_reference.id if item.parent_reference else None,
+                parent_external_record_id=(
+                    item.parent_reference.id if item.parent_reference and not shared_folder_root else None
+                ),
                 external_record_group_id=item.parent_reference.drive_id if item.parent_reference else None,
                 size_in_bytes=item.size,
                 is_file=item.folder is None,
@@ -1058,7 +1074,7 @@ class OneDriveConnector(BaseConnector):
 
             permission_failure = None
             # An item that inherits has no grants of its own: Graph would list its parent's.
-            inheritance = await self._inherits_parent_access(item)
+            inheritance = False if shared_folder_root else await self._inherits_parent_access(item)
             inherits = inheritance is True
             permission_result = []
             if not inherits:
@@ -2836,6 +2852,7 @@ class OneDriveConnector(BaseConnector):
                 await self._notices.nobody_synced()
 
             # Process users in concurrent batches
+            synced: list[AppUser] = []
             for i in range(0, len(users_to_sync), self.max_concurrent_batches):
                 batch = users_to_sync[i:i + self.max_concurrent_batches]
                 results = await asyncio.gather(
@@ -2845,9 +2862,12 @@ class OneDriveConnector(BaseConnector):
                 for user, result in zip(batch, results):
                     if isinstance(result, BaseException):
                         self._health.skipped_drive(user.email, _error_text(result))
+                    else:
+                        synced.append(user)
                 await asyncio.sleep(1)
 
             self.logger.info("Completed processing all user batches")
+            await self._sync_shared_folders(synced, {u.source_user_id for u in users_to_sync})
 
         except Exception as e:
             self.logger.error(f"❌ Error processing users in batches: {e}")
@@ -2857,6 +2877,153 @@ class OneDriveConnector(BaseConnector):
                 await self._drives.save()
             except Exception as e:
                 self.logger.error(f"❌ Could not save the known OneDrives: {e}")
+
+    async def _sync_shared_folders(self, synced: list[AppUser], to_sync: set[str]) -> None:
+        """Sync the folders synced users added to their OneDrive as shortcuts (`shortcuts.py`), unless the
+        folder's own OneDrive is synced anyway; remove what no shortcut brings in any more."""
+        registry = self._shortcuts
+        await registry.load()
+        full = self.data_entities_processor.full_sync_running(self.connector_id)
+        now = get_epoch_timestamp_in_ms()
+        registry.keep_holders(to_sync)
+        synced_drives = {self._drives.drive_of(u) for u in self._drives.users()} - {None}
+        try:
+            for user in synced:
+                drive_id = self._drives.drive_of(user.source_user_id)
+                if not drive_id or not (full or registry.check_due(user.source_user_id, now)):
+                    continue
+                try:
+                    found = await self.msgraph_client.list_drive_shortcuts(drive_id)
+                except Exception as e:
+                    # What was found before stands: a failed look is not "no shortcuts".
+                    self._health.skipped(f"shortcuts in the OneDrive of {user.email}", _error_text(e))
+                    continue
+                registry.found(user.source_user_id, [
+                    SharedFolder(s["drive_id"], s["item_id"]) for s in found
+                    if s["is_folder"] and s["drive_type"] in FOLLOWED_DRIVE_TYPES and s["drive_id"] != drive_id
+                ], now)
+
+            emptied: set[str] = set()
+            for folder in registry.unheld():
+                if folder.drive_id not in synced_drives:
+                    await self._remove_shared_folder(folder)
+                    emptied.add(folder.drive_id)
+                registry.forget(folder)
+
+            by_drive: dict[str, list[SharedFolder]] = {}
+            for folder in registry.held():
+                if folder.drive_id in synced_drives:
+                    continue
+                if full or folder.drive_id in emptied or registry.read_due(folder, now):
+                    by_drive.setdefault(folder.drive_id, []).append(folder)
+            for drive_id, folders in by_drive.items():
+                await self._read_shared_folders(drive_id, folders, registry, now)
+            for drive_id in emptied - set(by_drive):
+                if not registry.folders_in(drive_id):
+                    await self.data_entities_processor.on_record_group_deleted(drive_id, self.connector_id)
+        finally:
+            await registry.save()
+
+    async def _read_shared_folders(
+        self, drive_id: str, folders: list[SharedFolder], registry: ShortcutRegistry, now: int
+    ) -> None:
+        """List each folder whole (a folder in another drive has no delta), write what it holds, then remove
+        what was stored under it and no listing of this drive had."""
+        listed: set[str] = set()
+        complete: list[SharedFolder] = []
+        group_written = False
+        for folder in folders:
+            try:
+                root = await self.msgraph_client.get_drive_item(drive_id, folder.item_id)
+            except ODataError as e:
+                if e.response_status_code == HTTPStatus.NOT_FOUND:
+                    self.logger.info(f"Shared folder {folder.item_id} is gone; removing it")
+                    await self._remove_shared_folder(folder)
+                    registry.forget(folder)
+                    continue
+                await self._keep_drive(drive_id)
+                self._health.skipped(f"shared folder {folder.item_id}", sanitize_graph_error(e))
+                continue
+            except Exception as e:
+                await self._keep_drive(drive_id)
+                self._health.skipped(f"shared folder {folder.item_id}", _error_text(e))
+                continue
+            try:
+                if not group_written:
+                    await self._save_shared_drive_group(drive_id)
+                    group_written = True
+                items = [root]
+                pending = [root.id]
+                while pending:
+                    children = await self.msgraph_client.list_folder_children(drive_id, pending.pop(0),
+                                                                              raise_on_error=True)
+                    items.extend(children)
+                    pending.extend(c.id for c in children if c.folder is not None)
+                await self._write_listed_items(items, root.id)
+            except Exception as e:
+                await self._keep_drive(drive_id)
+                self._health.skipped(f"shared folder {folder.item_id}", _error_text(e))
+                continue
+            listed.update(i.id for i in items if i.id)
+            complete.append(folder)
+            registry.read(folder, now)
+        for folder in complete:
+            for record in reversed(await self._stored_descendants(folder.item_id)):
+                if record.external_record_id not in listed:
+                    await self.data_entities_processor.on_record_deleted(record_id=record.id)
+
+    async def _write_listed_items(self, items: list[DriveItem], root_id: str) -> None:
+        processed = []
+        for item in items:
+            update = await self._process_delta_item(
+                item, hold_page_on_incomplete_walk=False, shared_folder_root=item.id == root_id
+            )
+            if update is None:
+                continue
+            if update.record is None:
+                # Out of the sync's scope now (filters): a file synced before leaves.
+                if update.is_deleted:
+                    await self._handle_record_updates(update)
+                continue
+            if update.record.is_shared and not self.indexing_filters.is_enabled(IndexingFilterKey.SHARED, default=True):
+                update.record.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
+            if not self.indexing_filters.is_enabled(IndexingFilterKey.FILES, default=True):
+                update.record.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
+            processed.append(update)
+        batch = []
+        for update in processed:
+            if update.is_updated:
+                await self._handle_record_updates(update)
+            elif update.is_new:
+                batch.append((update.record, update.new_permissions or []))
+            if len(batch) >= self.batch_size:
+                await self.data_entities_processor.on_new_records(batch)
+                batch = []
+        if batch:
+            await self.data_entities_processor.on_new_records(batch)
+
+    async def _save_shared_drive_group(self, drive_id: str) -> None:
+        """The record group of a OneDrive whose owner is not synced: no owner grant, only the folders'."""
+        drive = await self.msgraph_client.get_drive(drive_id)
+        owner = getattr(getattr(drive, "owner", None), "user", None)
+        name = getattr(owner, "display_name", None)
+        await self.data_entities_processor.on_new_record_groups([(RecordGroup(
+            external_group_id=drive_id,
+            name=f"{name}'s OneDrive" if name else f"OneDrive {drive_id}",
+            group_type=RecordGroupType.DRIVE,
+            connector_name=self.connector_name,
+            connector_id=self.connector_id,
+            web_url=getattr(drive, "web_url", None),
+            description=f"Folders shared from the OneDrive of {name or drive_id}",
+        ), None)])
+
+    async def _remove_shared_folder(self, folder: SharedFolder) -> None:
+        record = await self.data_entities_processor.get_record_by_external_id(self.connector_id, folder.item_id)
+        if record is None:
+            return
+        for child in reversed(await self._stored_descendants(folder.item_id)):
+            await self.data_entities_processor.on_record_deleted(record_id=child.id)
+        await self.data_entities_processor.on_record_deleted(record_id=record.id)
 
     async def _notify_onedrive_user_failures(
         self,

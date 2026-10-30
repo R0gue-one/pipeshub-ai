@@ -16,6 +16,11 @@ from app.connectors.sources.microsoft.onedrive.group_nesting import (
     GroupNesting,
 )
 from app.connectors.sources.microsoft.onedrive.notices import OneDriveNotices
+from app.connectors.sources.microsoft.onedrive.shortcuts import (
+    CHECK_INTERVAL_MS,
+    SharedFolder,
+    ShortcutRegistry,
+)
 from app.connectors.sources.microsoft.onedrive.run_health import (
     OneDriveSyncIncomplete,
     RunHealth,
@@ -316,3 +321,65 @@ class TestFolderAccess:
         assert point.writes == []
         assert access.changed("d1", []) is None
 
+
+
+PLANS = SharedFolder("drive-sam", "s1")
+DOCS = SharedFolder("drive-sam", "s2")
+
+
+class TestShortcutRegistry:
+    async def test_a_folder_stays_while_anyone_holds_a_shortcut_to_it(self) -> None:
+        registry = ShortcutRegistry(_SyncPoint().read, _SyncPoint().write)
+        await registry.load()
+        registry.found("ana", [PLANS], 0)
+        registry.found("ben", [PLANS, DOCS], 0)
+
+        registry.found("ana", [], 1)
+
+        assert registry.held() == [PLANS, DOCS]
+        registry.found("ben", [DOCS], 2)
+        assert registry.unheld() == [PLANS]
+
+    async def test_users_no_longer_synced_hold_nothing(self) -> None:
+        registry = ShortcutRegistry(_SyncPoint().read, _SyncPoint().write)
+        await registry.load()
+        registry.found("ana", [PLANS], 0)
+
+        registry.keep_holders({"ben"})
+
+        assert registry.unheld() == [PLANS]
+        assert registry.check_due("ana", 0) is True
+
+    async def test_looks_and_reads_are_due_once_an_interval_has_passed(self) -> None:
+        registry = ShortcutRegistry(_SyncPoint().read, _SyncPoint().write)
+        await registry.load()
+        registry.found("ana", [PLANS], 1000)
+
+        assert registry.check_due("ana", 1000 + CHECK_INTERVAL_MS - 1) is False
+        assert registry.check_due("ana", 1000 + CHECK_INTERVAL_MS) is True
+        assert registry.read_due(PLANS, 1000) is True  # never read yet
+        registry.read(PLANS, 1000)
+        assert registry.read_due(PLANS, 1000 + CHECK_INTERVAL_MS - 1) is False
+
+    async def test_it_survives_a_restart_as_json_text(self) -> None:
+        point = _SyncPoint()
+        registry = ShortcutRegistry(point.read, point.write)
+        await registry.load()
+        registry.found("ana", [PLANS], 5)
+        await registry.save()
+
+        restarted = ShortcutRegistry(point.read, point.write)
+        await restarted.load()
+
+        assert restarted.held() == [PLANS]
+        assert restarted.folders_in("drive-sam") == [PLANS]
+        assert isinstance(json.loads((await point.read())["shortcuts"]), dict)
+
+    async def test_unreadable_state_starts_empty(self) -> None:
+        point = _SyncPoint()
+        await point.write({"shortcuts": "not json"})
+        registry = ShortcutRegistry(point.read, point.write)
+
+        await registry.load()
+
+        assert registry.held() == []
