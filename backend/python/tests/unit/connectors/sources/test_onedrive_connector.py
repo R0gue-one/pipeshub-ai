@@ -10,6 +10,7 @@ from fastapi import HTTPException
 from app.config.constants.arangodb import Connectors, MimeTypes, OriginTypes, ProgressStatus
 from app.connectors.sources.microsoft.common.msgraph_client import RecordUpdate
 from app.connectors.sources.microsoft.onedrive.connector import (
+    DrivePageIncompleteError,
     GraphReadFailedError,
     _FolderWalk,
     OneDriveConnector,
@@ -40,6 +41,29 @@ def _make_mock_logger():
     return logging.getLogger("test.onedrive")
 
 
+def _make_data_store_provider():
+    """A store whose sync points are empty, as for a connector that never synced."""
+    tx_store = AsyncMock()
+    tx_store.get_sync_point = AsyncMock(return_value=None)
+    data_store_provider = MagicMock()
+    data_store_provider.transaction.return_value.__aenter__.return_value = tx_store
+    return data_store_provider
+
+
+def _stored_sync_point(initial=None):
+    """A sync point that keeps what is written to it, merged as the store does."""
+    stored = dict(initial or {})
+    sync_point = MagicMock()
+    sync_point.stored = stored
+
+    async def update(key, data):
+        stored.update(data)
+
+    sync_point.read_sync_point = AsyncMock(side_effect=lambda key: dict(stored) or None)
+    sync_point.update_sync_point = AsyncMock(side_effect=update)
+    return sync_point
+
+
 def _make_mock_deps():
     """Create mocked dependencies for the OneDrive connector."""
     logger = _make_mock_logger()
@@ -58,7 +82,7 @@ def _make_mock_deps():
     data_entities_processor.get_all_active_users = AsyncMock(return_value=[])
     data_entities_processor.reindex_existing_records = AsyncMock()
 
-    data_store_provider = MagicMock()
+    data_store_provider = _make_data_store_provider()
     config_service = MagicMock()
     config_service.get_config = AsyncMock()
 
@@ -277,12 +301,19 @@ class TestProcessDeltaItem:
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_error_in_processing_returns_none(self):
+    async def test_error_in_processing_returns_none_when_the_page_is_not_held(self):
         connector = _make_connector()
         # No msgraph_client set - will cause an error
         item = _make_drive_item()
-        result = await connector._process_delta_item(item)
+        result = await connector._process_delta_item(item, hold_page_on_incomplete_walk=False)
         assert result is None
+
+    @pytest.mark.asyncio
+    async def test_error_in_processing_holds_the_page(self):
+        connector = _make_connector()
+        item = _make_drive_item()
+        with pytest.raises(DrivePageIncompleteError, match="item-1"):
+            await connector._process_delta_item(item)
 
 
 # ===========================================================================
@@ -367,6 +398,56 @@ class TestConvertToPermissions:
 
         permissions = await connector._convert_to_permissions([perm])
         assert permissions == []  # an organization link alone is not a grant
+
+    @staticmethod
+    def _user_grant_without_email(user_id: str) -> MagicMock:
+        perm = MagicMock()
+        perm.roles = ["read"]
+        user = MagicMock()
+        user.id = user_id
+        user.additional_data = {}  # Graph shows no email for a user without a mailbox
+        perm.granted_to_v2 = MagicMock()
+        perm.granted_to_v2.user = user
+        perm.granted_to_v2.group = None
+        perm.granted_to_identities_v2 = None
+        perm.link = None
+        return perm
+
+    @pytest.mark.asyncio
+    async def test_user_grant_without_email_is_named_from_the_user_list(self):
+        connector = _make_connector()
+        connector._user_emails = {"u-1": "nomail@contoso.onmicrosoft.com"}
+        connector.msgraph_client = MagicMock()
+        connector.msgraph_client.get_user_email = AsyncMock()
+
+        permissions = await connector._convert_to_permissions([self._user_grant_without_email("u-1")])
+
+        assert [p.email for p in permissions] == ["nomail@contoso.onmicrosoft.com"]
+        connector.msgraph_client.get_user_email.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_user_grant_without_email_is_looked_up_once(self):
+        connector = _make_connector()
+        connector._user_emails = {}
+        connector.msgraph_client = MagicMock()
+        connector.msgraph_client.get_user_email = AsyncMock(return_value="later@contoso.onmicrosoft.com")
+
+        for _ in range(2):
+            permissions = await connector._convert_to_permissions([self._user_grant_without_email("u-2")])
+            assert [p.email for p in permissions] == ["later@contoso.onmicrosoft.com"]
+
+        connector.msgraph_client.get_user_email.assert_awaited_once_with("u-2")
+
+    @pytest.mark.asyncio
+    async def test_user_grant_whose_email_cannot_be_read_stays_without_one(self):
+        connector = _make_connector()
+        connector._user_emails = {}
+        connector.msgraph_client = MagicMock()
+        connector.msgraph_client.get_user_email = AsyncMock(side_effect=RuntimeError("503"))
+
+        permissions = await connector._convert_to_permissions([self._user_grant_without_email("u-3")])
+
+        assert [p.email for p in permissions] == [None]
 
 
 # ===========================================================================
@@ -465,6 +546,7 @@ class TestHandleRecordUpdates:
         mock_record = MagicMock()
         mock_record.id = "record-1"
         connector.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=mock_record)
+        connector.data_entities_processor.get_records_by_parent = AsyncMock(return_value=[])
 
         update = RecordUpdate(
             record=None,
@@ -559,7 +641,7 @@ class TestGroupHandling:
         member.display_name = "Test User"
         member.created_date_time = None
         member.additional_data = {}
-        connector.msgraph_client.get_group_members = AsyncMock(return_value=[member])
+        connector.msgraph_client.get_group_transitive_members = AsyncMock(return_value=[member])
 
         group = MagicMock()
         group.id = "grp-1"
@@ -577,7 +659,7 @@ class TestGroupHandling:
     async def test_handle_group_create_failure(self):
         connector = _make_connector()
         connector.msgraph_client = MagicMock()
-        connector.msgraph_client.get_group_members = AsyncMock(side_effect=Exception("API error"))
+        connector.msgraph_client.get_group_transitive_members = AsyncMock(side_effect=Exception("API error"))
 
         group = MagicMock()
         group.id = "grp-fail"
@@ -1160,54 +1242,85 @@ class TestSyncUserGroupsDeep:
         connector = _make_connector()
         connector.msgraph_client = MagicMock()
 
-        connector.user_group_sync_point = MagicMock()
-        connector.user_group_sync_point.read_sync_point = AsyncMock(return_value=None)
-        connector.user_group_sync_point.update_sync_point = AsyncMock()
+        connector.user_group_sync_point = _stored_sync_point()
 
         connector._get_initial_delta_link = AsyncMock(
             return_value="https://graph.microsoft.com/v1.0/groups/delta?token=abc"
         )
-        connector._perform_initial_full_sync = AsyncMock()
+        connector._perform_initial_full_sync = AsyncMock(return_value=True)
 
         await connector._sync_user_groups()
 
         connector._get_initial_delta_link.assert_awaited_once()
         connector._perform_initial_full_sync.assert_awaited_once()
         connector.user_group_sync_point.update_sync_point.assert_awaited_once()
+        assert connector.user_group_sync_point.stored["membersTransitive"] is True
 
     @pytest.mark.asyncio
     async def test_incremental_delta_sync(self):
         connector = _make_connector()
         connector.msgraph_client = MagicMock()
 
-        connector.user_group_sync_point = MagicMock()
-        connector.user_group_sync_point.read_sync_point = AsyncMock(
-            return_value={'deltaLink': 'https://graph.microsoft.com/v1.0/groups/delta?token=xyz'}
+        connector.user_group_sync_point = _stored_sync_point(
+            {'deltaLink': 'https://graph.microsoft.com/v1.0/groups/delta?token=xyz', 'membersTransitive': True}
         )
-        connector.user_group_sync_point.update_sync_point = AsyncMock()
 
         connector._perform_delta_sync = AsyncMock()
+        connector._perform_initial_full_sync = AsyncMock(return_value=True)
 
         await connector._sync_user_groups()
 
         connector._perform_delta_sync.assert_awaited_once()
+        connector._perform_initial_full_sync.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_groups_stored_without_the_transitive_marker_are_read_again_once(self):
+        connector = _make_connector()
+        connector.msgraph_client = MagicMock()
+        connector.user_group_sync_point = _stored_sync_point(
+            {'deltaLink': 'https://graph.microsoft.com/v1.0/groups/delta?token=xyz'}
+        )
+        connector._perform_delta_sync = AsyncMock()
+        connector._perform_initial_full_sync = AsyncMock(return_value=True)
+
+        await connector._sync_user_groups()
+        await connector._sync_user_groups()
+
+        connector._perform_initial_full_sync.assert_awaited_once()
+        assert connector.user_group_sync_point.stored["membersTransitive"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_failed_read_for_the_transitive_marker_leaves_the_bounded_retry_owed(self):
+        connector = _make_connector()
+        connector.msgraph_client = MagicMock()
+        connector.user_group_sync_point = _stored_sync_point(
+            {'deltaLink': 'https://graph.microsoft.com/v1.0/groups/delta?token=xyz'}
+        )
+        connector._perform_delta_sync = AsyncMock()
+        connector._perform_initial_full_sync = AsyncMock(return_value=False)
+
+        await connector._sync_user_groups()
+
+        # The run doesn't fail; the unread groups keep their members and go to the bounded full-group retry.
+        assert connector._health.problems == []
+        stored = connector.user_group_sync_point.stored
+        assert stored["membersTransitive"] is True
+        assert stored["fullSyncIncomplete"] is True and stored["fullSyncAttempts"] == 1
 
     @pytest.mark.asyncio
     async def test_initial_sync_no_delta_link_obtained(self):
         connector = _make_connector()
         connector.msgraph_client = MagicMock()
 
-        connector.user_group_sync_point = MagicMock()
-        connector.user_group_sync_point.read_sync_point = AsyncMock(return_value=None)
-        connector.user_group_sync_point.update_sync_point = AsyncMock()
+        connector.user_group_sync_point = _stored_sync_point()
 
         connector._get_initial_delta_link = AsyncMock(return_value=None)
-        connector._perform_initial_full_sync = AsyncMock()
+        connector._perform_initial_full_sync = AsyncMock(return_value=True)
 
         await connector._sync_user_groups()
 
-        # Should not save sync point when no delta link
-        connector.user_group_sync_point.update_sync_point.assert_not_awaited()
+        # No delta link is saved without one; only the transitive-members marker is.
+        assert connector.user_group_sync_point.stored == {"membersTransitive": True}
 
 
 # ===========================================================================
@@ -1493,7 +1606,7 @@ class TestProcessSingleGroup:
         member.created_date_time = None
         member.additional_data = {}
 
-        connector.msgraph_client.get_group_members = AsyncMock(return_value=[member])
+        connector.msgraph_client.get_group_transitive_members = AsyncMock(return_value=[member])
 
         group = MagicMock()
         group.id = "g1"
@@ -1519,13 +1632,15 @@ class TestProcessSingleGroup:
         nested_group.display_name = "Nested Group"
         nested_group.additional_data = {}
 
-        connector.msgraph_client.get_group_members = AsyncMock(return_value=[nested_group])
+        nested_user = MagicMock()
+        nested_user.id = "nu1"
+        nested_user.odata_type = "#microsoft.graph.user"
+        nested_user.mail = "nested@test.com"
+        nested_user.display_name = "Nested User"
+        nested_user.created_date_time = None
+        nested_user.additional_data = {}
 
-        nested_user = AppUser(
-            app_name=Connectors.ONEDRIVE, connector_id="conn-1",
-            source_user_id="nu1", email="nested@test.com", full_name="Nested User",
-        )
-        connector._get_users_from_nested_group = AsyncMock(return_value=[nested_user])
+        connector.msgraph_client.get_group_transitive_members = AsyncMock(return_value=[nested_group, nested_user])
 
         group = MagicMock()
         group.id = "g1"
@@ -1543,7 +1658,7 @@ class TestProcessSingleGroup:
     async def test_group_error_returns_none(self):
         connector = _make_connector()
         connector.msgraph_client = MagicMock()
-        connector.msgraph_client.get_group_members = AsyncMock(side_effect=Exception("API error"))
+        connector.msgraph_client.get_group_transitive_members = AsyncMock(side_effect=Exception("API error"))
 
         group = MagicMock()
         group.id = "g1"
@@ -1700,49 +1815,94 @@ class TestCreateAppUserFromMember:
 
 
 # ===========================================================================
-# Deep Sync: _get_users_from_nested_group
+# _collect_group_users: members at any depth
 # ===========================================================================
 
 
-class TestGetUsersFromNestedGroup:
+class TestCollectGroupUsers:
+
+    @staticmethod
+    def _user(user_id: str, email: str) -> MagicMock:
+        member = MagicMock()
+        member.id = user_id
+        member.odata_type = "#microsoft.graph.user"
+        member.mail = email
+        member.display_name = user_id
+        member.created_date_time = None
+        member.additional_data = {}
+        return member
+
+    @staticmethod
+    def _group() -> MagicMock:
+        group = MagicMock()
+        group.id = "grp-outer"
+        group.display_name = "Outer"
+        return group
 
     @pytest.mark.asyncio
-    async def test_fetches_nested_users(self):
+    async def test_users_of_nested_groups_come_from_transitive_members(self):
         connector = _make_connector()
         connector.msgraph_client = MagicMock()
-
-        nested_member = MagicMock()
-        nested_member.id = "nm1"
-        nested_member.odata_type = "#microsoft.graph.user"
-        nested_member.mail = "nested@test.com"
-        nested_member.display_name = "Nested"
-        nested_member.created_date_time = None
-        nested_member.user_principal_name = "nested@test.com"
-        nested_member.additional_data = {}
-
-        connector.msgraph_client.get_group_members = AsyncMock(return_value=[nested_member])
-
         nested_group = MagicMock()
-        nested_group.id = "ng1"
-        nested_group.display_name = "Nested Group"
+        nested_group.id = "ng-1"
+        nested_group.odata_type = "#microsoft.graph.group"
+        nested_group.additional_data = {}
+        connector.msgraph_client.get_group_transitive_members = AsyncMock(
+            return_value=[nested_group, self._user("nested-user-1", "nested@test.com")]
+        )
 
-        users = await connector._get_users_from_nested_group(nested_group)
-        assert len(users) == 1
-        assert users[0].email == "nested@test.com"
+        result = await connector._collect_group_users(self._group())
+
+        connector.msgraph_client.get_group_transitive_members.assert_awaited_once_with("grp-outer")
+        assert [u.email for u in result] == ["nested@test.com"]
+        assert connector._nesting.outer_groups("ng-1") == {"grp-outer"}
 
     @pytest.mark.asyncio
-    async def test_error_returns_none(self):
+    async def test_non_user_members_are_skipped(self):
         connector = _make_connector()
         connector.msgraph_client = MagicMock()
-        connector.msgraph_client.get_group_members = AsyncMock(side_effect=Exception("API error"))
+        non_user_member = MagicMock()
+        non_user_member.id = "svc-1"
+        non_user_member.odata_type = "#microsoft.graph.servicePrincipal"
+        non_user_member.additional_data = {}
+        connector.msgraph_client.get_group_transitive_members = AsyncMock(return_value=[non_user_member])
 
-        nested_group = MagicMock()
-        nested_group.id = "ng1"
-        nested_group.display_name = "Fail Group"
+        assert await connector._collect_group_users(self._group()) == []
+
+    @pytest.mark.asyncio
+    async def test_member_read_failure_raises(self):
+        connector = _make_connector()
+        connector.msgraph_client = MagicMock()
+        connector.msgraph_client.get_group_transitive_members = AsyncMock(side_effect=Exception("fail"))
 
         with pytest.raises(GraphReadFailedError) as err:
-            await connector._get_users_from_nested_group(nested_group)
+            await connector._collect_group_users(self._group())
         assert err.value.permanent is False
+
+    @pytest.mark.asyncio
+    async def test_user_listed_directly_and_through_a_nested_group_is_kept_once(self):
+        connector = _make_connector()
+        connector.msgraph_client = MagicMock()
+        connector.msgraph_client.get_group_transitive_members = AsyncMock(
+            return_value=[self._user("u-1", "u1@test.com"), self._user("u-1", "u1@test.com")]
+        )
+
+        result = await connector._collect_group_users(self._group())
+
+        assert [u.source_user_id for u in result] == ["u-1"]
+
+    @pytest.mark.asyncio
+    async def test_inactive_member_is_left_out(self):
+        connector = _make_connector()
+        connector.msgraph_client = MagicMock()
+        connector._inactive_emails = {"gone@test.com"}
+        connector.msgraph_client.get_group_transitive_members = AsyncMock(
+            return_value=[self._user("u-1", "u1@test.com"), self._user("u-2", "Gone@test.com")]
+        )
+
+        result = await connector._collect_group_users(self._group())
+
+        assert [u.email for u in result] == ["u1@test.com"]
 
 
 # ===========================================================================
@@ -1803,7 +1963,7 @@ def _make_mock_deps_cov():
 def _make_connector_cov():
     """Create an OneDrive connector with mocked dependencies."""
     logger, dep = _make_mock_deps_cov()
-    dsp = MagicMock()
+    dsp = _make_data_store_provider()
     cs = MagicMock()
     cs.get_config = AsyncMock()
     connector = OneDriveConnector(logger, dep, dsp, cs, "conn-onedrive-cov", "team", "test-user-id")
@@ -2080,6 +2240,8 @@ class TestProcessDeltaItemCoverage:
         connector = _make_connector_cov()
         connector._pass_date_filters = MagicMock(return_value=False)
 
+        connector.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=None)
+
         item = _make_drive_item()
         result = await connector._process_delta_item(item)
         assert result is None
@@ -2090,6 +2252,8 @@ class TestProcessDeltaItemCoverage:
         connector = _make_connector_cov()
         connector._pass_date_filters = MagicMock(return_value=True)
         connector._pass_extension_filter = MagicMock(return_value=False)
+
+        connector.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=None)
 
         item = _make_drive_item()
         result = await connector._process_delta_item(item)
@@ -2659,8 +2823,8 @@ class TestHandleRecordUpdatesCoverage:
         connector.data_entities_processor.on_updated_record_permissions.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_error_handling(self):
-        """Exception in handler does not propagate."""
+    async def test_error_is_raised_after_logging(self):
+        """Delta lists a change once, so a failed save is raised for the caller to hold the page."""
         connector = _make_connector_cov()
         connector.data_entities_processor.on_record_metadata_update = AsyncMock(side_effect=Exception("fail"))
 
@@ -2669,8 +2833,8 @@ class TestHandleRecordUpdatesCoverage:
             is_new=False, is_updated=True, is_deleted=False,
             metadata_changed=True, content_changed=False, permissions_changed=False,
         )
-        # Should not raise
-        await connector._handle_record_updates(update)
+        with pytest.raises(Exception, match="fail"):
+            await connector._handle_record_updates(update)
 
 
 # ===========================================================================
@@ -2685,18 +2849,17 @@ class TestSyncUserGroupsCoverage:
         """Initial sync but _get_initial_delta_link returns None."""
         connector = _make_connector_cov()
         connector.msgraph_client = MagicMock()
-        connector.user_group_sync_point = MagicMock()
-        connector.user_group_sync_point.read_sync_point = AsyncMock(return_value=None)
-        connector.user_group_sync_point.update_sync_point = AsyncMock()
+        connector.user_group_sync_point = _stored_sync_point()
 
         connector._get_initial_delta_link = AsyncMock(return_value=None)
-        connector._perform_initial_full_sync = AsyncMock()
+        connector._perform_initial_full_sync = AsyncMock(return_value=True)
 
         await connector._sync_user_groups()
 
-        connector._perform_initial_full_sync.assert_awaited_once()
-        # update_sync_point should NOT be called when delta_link is None
-        connector.user_group_sync_point.update_sync_point.assert_not_awaited()
+        # Without a delta link the first read can't store the marker, so the groups are read once more for it.
+        assert connector._perform_initial_full_sync.await_count == 2
+        # No delta link is saved without one; only the transitive-members marker is.
+        assert connector.user_group_sync_point.stored == {"membersTransitive": True}
 
     @pytest.mark.asyncio
     async def test_sync_raises_error(self):
@@ -2816,8 +2979,17 @@ class TestProcessSingleGroupCoverage:
         user_member.created_date_time = None
         user_member.additional_data = {}
 
-        connector.msgraph_client.get_group_members = AsyncMock(return_value=[user_member, nested_group_member])
-        connector._get_users_from_nested_group = AsyncMock(return_value=[MagicMock()])
+        nested_user_member = MagicMock()
+        nested_user_member.id = "u-2"
+        nested_user_member.odata_type = "#microsoft.graph.user"
+        nested_user_member.mail = "nested@test.com"
+        nested_user_member.display_name = "Nested"
+        nested_user_member.created_date_time = None
+        nested_user_member.additional_data = {}
+
+        connector.msgraph_client.get_group_transitive_members = AsyncMock(
+            return_value=[user_member, nested_group_member, nested_user_member]
+        )
 
         group = MagicMock()
         group.id = "grp-1"
@@ -2841,7 +3013,7 @@ class TestProcessSingleGroupCoverage:
         device_member.odata_type = "#microsoft.graph.device"
         device_member.additional_data = {}
 
-        connector.msgraph_client.get_group_members = AsyncMock(return_value=[device_member])
+        connector.msgraph_client.get_group_transitive_members = AsyncMock(return_value=[device_member])
 
         group = MagicMock()
         group.id = "grp-1"
@@ -2858,7 +3030,7 @@ class TestProcessSingleGroupCoverage:
     async def test_error_returns_none(self):
         connector = _make_connector_cov()
         connector.msgraph_client = MagicMock()
-        connector.msgraph_client.get_group_members = AsyncMock(side_effect=Exception("fail"))
+        connector.msgraph_client.get_group_transitive_members = AsyncMock(side_effect=Exception("fail"))
 
         group = MagicMock()
         group.id = "grp-err"
@@ -3061,81 +3233,94 @@ class TestProcessMemberChangeCoverage:
 
 
 # ===========================================================================
-# _get_users_from_nested_group
+# _collect_group_users: members at any depth
 # ===========================================================================
 
 
-class TestGetUsersFromNestedGroupCoverage:
+class TestCollectGroupUsersCoverage:
+
+    @staticmethod
+    def _user(user_id: str, email: str) -> MagicMock:
+        member = MagicMock()
+        member.id = user_id
+        member.odata_type = "#microsoft.graph.user"
+        member.mail = email
+        member.display_name = user_id
+        member.created_date_time = None
+        member.additional_data = {}
+        return member
+
+    @staticmethod
+    def _group() -> MagicMock:
+        group = MagicMock()
+        group.id = "grp-outer"
+        group.display_name = "Outer"
+        return group
 
     @pytest.mark.asyncio
-    async def test_nested_group_with_users(self):
+    async def test_users_of_nested_groups_come_from_transitive_members(self):
         connector = _make_connector_cov()
         connector.msgraph_client = MagicMock()
-
-        nested_member = MagicMock()
-        nested_member.id = "nested-user-1"
-        nested_member.odata_type = "#microsoft.graph.user"
-        nested_member.mail = "nested@test.com"
-        nested_member.display_name = "Nested User"
-        nested_member.created_date_time = None
-        nested_member.additional_data = {}
-
-        connector.msgraph_client.get_group_members = AsyncMock(return_value=[nested_member])
-
         nested_group = MagicMock()
         nested_group.id = "ng-1"
-        nested_group.display_name = "NestedGroup"
+        nested_group.odata_type = "#microsoft.graph.group"
+        nested_group.additional_data = {}
+        connector.msgraph_client.get_group_transitive_members = AsyncMock(
+            return_value=[nested_group, self._user("nested-user-1", "nested@test.com")]
+        )
 
-        result = await connector._get_users_from_nested_group(nested_group)
-        assert len(result) == 1
-        assert result[0].email == "nested@test.com"
+        result = await connector._collect_group_users(self._group())
+
+        connector.msgraph_client.get_group_transitive_members.assert_awaited_once_with("grp-outer")
+        assert [u.email for u in result] == ["nested@test.com"]
+        assert connector._nesting.outer_groups("ng-1") == {"grp-outer"}
 
     @pytest.mark.asyncio
-    async def test_nested_group_skips_non_users(self):
+    async def test_non_user_members_are_skipped(self):
         connector = _make_connector_cov()
         connector.msgraph_client = MagicMock()
-
         non_user_member = MagicMock()
         non_user_member.id = "svc-1"
         non_user_member.odata_type = "#microsoft.graph.servicePrincipal"
         non_user_member.additional_data = {}
+        connector.msgraph_client.get_group_transitive_members = AsyncMock(return_value=[non_user_member])
 
-        connector.msgraph_client.get_group_members = AsyncMock(return_value=[non_user_member])
-
-        nested_group = MagicMock()
-        nested_group.id = "ng-1"
-        nested_group.display_name = "NestedGroup"
-
-        result = await connector._get_users_from_nested_group(nested_group)
-        assert len(result) == 0
+        assert await connector._collect_group_users(self._group()) == []
 
     @pytest.mark.asyncio
-    async def test_nested_group_error(self):
+    async def test_member_read_failure_raises(self):
         connector = _make_connector_cov()
         connector.msgraph_client = MagicMock()
-        connector.msgraph_client.get_group_members = AsyncMock(side_effect=Exception("fail"))
-
-        nested_group = MagicMock()
-        nested_group.id = "ng-err"
-        nested_group.display_name = "NestedGroupErr"
+        connector.msgraph_client.get_group_transitive_members = AsyncMock(side_effect=Exception("fail"))
 
         with pytest.raises(GraphReadFailedError) as err:
-            await connector._get_users_from_nested_group(nested_group)
+            await connector._collect_group_users(self._group())
         assert err.value.permanent is False
 
     @pytest.mark.asyncio
-    async def test_nested_group_no_display_name(self):
-        """Nested group without display_name falls back to id."""
+    async def test_user_listed_directly_and_through_a_nested_group_is_kept_once(self):
         connector = _make_connector_cov()
         connector.msgraph_client = MagicMock()
-        connector.msgraph_client.get_group_members = AsyncMock(return_value=[])
+        connector.msgraph_client.get_group_transitive_members = AsyncMock(
+            return_value=[self._user("u-1", "u1@test.com"), self._user("u-1", "u1@test.com")]
+        )
 
-        nested_group = MagicMock(spec=[])
-        nested_group.id = "ng-no-name"
-        # No display_name attribute
+        result = await connector._collect_group_users(self._group())
 
-        result = await connector._get_users_from_nested_group(nested_group)
-        assert result == []
+        assert [u.source_user_id for u in result] == ["u-1"]
+
+    @pytest.mark.asyncio
+    async def test_inactive_member_is_left_out(self):
+        connector = _make_connector_cov()
+        connector.msgraph_client = MagicMock()
+        connector._inactive_emails = {"gone@test.com"}
+        connector.msgraph_client.get_group_transitive_members = AsyncMock(
+            return_value=[self._user("u-1", "u1@test.com"), self._user("u-2", "Gone@test.com")]
+        )
+
+        result = await connector._collect_group_users(self._group())
+
+        assert [u.email for u in result] == ["u1@test.com"]
 
 
 # ===========================================================================
@@ -3738,16 +3923,31 @@ class TestReindexRecordsCoverage:
         updated_record = MagicMock()
         updated_perms = [MagicMock()]
 
-        # rec1: updated, rec2: not updated, rec3: error
+        # rec1: content changed, rec2: not updated, rec3: error
         connector._check_and_fetch_updated_record = AsyncMock(side_effect=[
-            (updated_record, updated_perms),
+            (updated_record, updated_perms, True),
             None,
             Exception("fetch err"),
         ])
 
         await connector.reindex_records([rec1, rec2, rec3])
-        connector.data_entities_processor.on_new_records.assert_awaited_once()
-        connector.data_entities_processor.reindex_existing_records.assert_awaited_once()
+        connector.data_entities_processor.on_new_records.assert_awaited_once_with([(updated_record, updated_perms)])
+        connector.data_entities_processor.reindex_existing_records.assert_awaited_once_with([rec2])
+
+    @pytest.mark.asyncio
+    async def test_record_whose_content_did_not_change_is_saved_and_requeued(self):
+        """A change to metadata or access alone publishes nothing, so the record is re-queued as well."""
+        connector = _make_connector_cov()
+        connector.msgraph_client = MagicMock()
+        rec = MagicMock()
+        rec.id = "r1"
+        updated_record = MagicMock()
+        connector._check_and_fetch_updated_record = AsyncMock(return_value=(updated_record, [], False))
+
+        await connector.reindex_records([rec])
+
+        connector.data_entities_processor.on_new_records.assert_awaited_once_with([(updated_record, [])])
+        connector.data_entities_processor.reindex_existing_records.assert_awaited_once_with([rec])
 
     @pytest.mark.asyncio
     async def test_reindex_all_records_have_errors(self):
@@ -3832,6 +4032,7 @@ class TestCheckAndFetchUpdatedRecord:
         result = await connector._check_and_fetch_updated_record("org-1", record)
         assert result is not None
         assert result[0].id == "r1"
+        assert result[2] is False
 
     @pytest.mark.asyncio
     async def test_record_not_updated(self):
@@ -4046,6 +4247,7 @@ class TestConnectionAndAccess:
         connector = _make_connector_cov()
         connector._probe_users_scope = AsyncMock()
         connector._probe_groups_scope = AsyncMock()
+        connector._probe_files_scope = AsyncMock()
         connector.notify = AsyncMock()
 
         result = await connector.test_connection_and_access()
@@ -4059,6 +4261,7 @@ class TestConnectionAndAccess:
         connector = _make_connector_cov()
         connector._probe_users_scope = AsyncMock(side_effect=_make_403_odata_error_cov())
         connector._probe_groups_scope = AsyncMock()
+        connector._probe_files_scope = AsyncMock()
         connector.notify = AsyncMock()
 
         with pytest.raises(ConnectionError, match=r"User\.Read\.All"):
@@ -4072,6 +4275,7 @@ class TestConnectionAndAccess:
         connector = _make_connector_cov()
         connector._probe_users_scope = AsyncMock()
         connector._probe_groups_scope = AsyncMock(side_effect=_make_403_odata_error_cov())
+        connector._probe_files_scope = AsyncMock()
         connector.notify = AsyncMock()
 
         with pytest.raises(ConnectionError, match=r"Group\.Read\.All"):
@@ -4080,19 +4284,18 @@ class TestConnectionAndAccess:
         connector.notify.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_files_read_all_validation_is_deferred_to_sync(self):
-        """Connection testing does not probe an arbitrary tenant user's drive."""
+    async def test_missing_files_read_all_raises_after_notification(self):
+        """403 reading a OneDrive → notify, then raise with Files.Read.All in message."""
         connector = _make_connector_cov()
         connector._probe_users_scope = AsyncMock()
         connector._probe_groups_scope = AsyncMock()
-        connector._probe_drives_scope = AsyncMock(side_effect=_make_403_odata_error_cov())
+        connector._probe_files_scope = AsyncMock(side_effect=_make_403_odata_error_cov())
         connector.notify = AsyncMock()
 
-        result = await connector.test_connection_and_access()
+        with pytest.raises(ConnectionError, match=r"Files\.Read\.All"):
+            await connector.test_connection_and_access()
 
-        assert result is True
-        connector._probe_drives_scope.assert_not_awaited()
-        connector.notify.assert_not_called()
+        connector.notify.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_all_directory_scopes_missing_single_notification(self):
@@ -4100,6 +4303,7 @@ class TestConnectionAndAccess:
         connector = _make_connector_cov()
         connector._probe_users_scope = AsyncMock(side_effect=_make_403_odata_error_cov())
         connector._probe_groups_scope = AsyncMock(side_effect=_make_403_odata_error_cov())
+        connector._probe_files_scope = AsyncMock()
         connector.notify = AsyncMock()
 
         with pytest.raises(
@@ -4119,6 +4323,7 @@ class TestConnectionAndAccess:
         connector = _make_connector_cov()
         connector._probe_users_scope = AsyncMock(side_effect=_make_transient_odata_error_cov())
         connector._probe_groups_scope = AsyncMock()
+        connector._probe_files_scope = AsyncMock()
         connector.notify = AsyncMock()
 
         with pytest.raises(ConnectionError, match=r"ServiceUnavailable.*HTTP 503"):
@@ -4132,6 +4337,7 @@ class TestConnectionAndAccess:
         connector = _make_connector_cov()
         connector._probe_users_scope = AsyncMock(side_effect=RuntimeError("network down"))
         connector._probe_groups_scope = AsyncMock()
+        connector._probe_files_scope = AsyncMock()
         connector.notify = AsyncMock()
 
         with pytest.raises(

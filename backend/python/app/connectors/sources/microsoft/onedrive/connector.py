@@ -71,12 +71,20 @@ from app.connectors.core.registry.filters import (
     load_connector_filters,
 )
 from app.connectors.core.registry.types import FileContentValidationRule, ValidationRuleType
+from app.connectors.core.sync.full_sync_coverage import FullSyncCoverage
 from app.connectors.sources.microsoft.common.apps import OneDriveApp
 from app.connectors.sources.microsoft.common.msgraph_client import (
     MSGraphClient,
     RecordUpdate,
     map_msgraph_roles_to_permission_type,
 )
+from app.connectors.sources.microsoft.onedrive.drive_registry import DriveRegistry
+from app.connectors.sources.microsoft.onedrive.group_nesting import GroupNesting
+from app.connectors.sources.microsoft.onedrive.folder_access import FolderAccess
+from app.connectors.sources.microsoft.onedrive.notices import OneDriveNotices
+from app.connectors.sources.microsoft.onedrive.run_health import RunHealth
+from app.connectors.sources.microsoft.sharepoint_online.drive_reconciler import DriveReconciler
+from app.connectors.sources.google.drive.team.user_status import UserStatusTracker
 from app.connectors.sources.microsoft.common.sharepoint_permission_scope import (
     ListUniquePermissions,
     SharePointAccessError,
@@ -162,6 +170,12 @@ CERTIFICATE_SETUP_DOCS_URL = "https://docs.pipeshub.com/connectors/microsoft-365
 SHAREPOINT_HEALTH_OK = "ok"
 SHAREPOINT_HEALTH_REFUSED = "refused"
 SHAREPOINT_HEALTH_FORBIDDEN = "forbidden"
+# Whether delta links ask Graph for sharing changes (Prefer: deltashowsharingchanges). They don't: without Graph
+# Sites.FullControl.All, which PipesHub doesn't ask for, a OneDrive answers such a link 410 resyncRequired after
+# any change to a folder's sharing, while a plain link lists every item whose own sharing changed (live probe of a
+# real OneDrive, 2026-10-29). A link stores which kind it is ("sharingChanges"): Graph honours a link only with
+# the preference it was made with.
+REQUEST_SHARING_CHANGES = False
 # How often a connector still signing in with a client secret reminds its admin about certificates.
 CERTIFICATE_REMINDER_INTERVAL_MS = 7 * 24 * 3600 * 1000
 # How many users the setup form's connection check tries before it finds one with a OneDrive.
@@ -182,6 +196,30 @@ class GraphReadFailedError(Exception):
 def _read_failure(what: str, error: Exception) -> GraphReadFailedError:
     status = error.response_status_code if isinstance(error, ODataError) else None
     return GraphReadFailedError(f"could not read {what}: {error}", permanent=status in _PERMANENT_READ_STATUSES)
+
+
+# What Graph answers a delta link it no longer honours: 410 Gone (resyncRequired), or for directory objects such
+# as groups a 400 whose code names the expired sync state.
+_EXPIRED_TOKEN_CODES = frozenset({"resyncrequired", "syncstatenotfound", "request_deltatokenexpired"})
+
+
+def _delta_token_expired(error: ODataError) -> bool:
+    if error.response_status_code == HTTPStatus.GONE:
+        return True
+    code = (error.error.code or "").lower() if error.error else ""
+    return error.response_status_code == HTTPStatus.BAD_REQUEST and code in _EXPIRED_TOKEN_CODES
+
+
+def _has_extension(item: DriveItem) -> bool:
+    """Files are synced only with an extension (indexing needs one); folders always."""
+    return item.folder is not None or bool(item.name and "." in item.name)
+
+
+def _error_text(error: BaseException) -> str:
+    """A short description of an error for a notice or the run's outcome; never a request's headers."""
+    if isinstance(error, ODataError):
+        return sanitize_graph_error(error)
+    return f"{type(error).__name__}: {str(error)[:200]}"
 
 
 @dataclass
@@ -411,11 +449,6 @@ ONEDRIVE_USER_FAILURE_NOTIFICATIONS: Dict[OneDriveUserStatus, Tuple[str, str]] =
         "OneDrive blocked for some users",
         "OneDrive is archived, or blocked for these users, so they were not synced: {emails}.",
     ),
-    OneDriveUserStatus.UNKNOWN_ERROR: (
-        "Some OneDrive users could not be synced",
-        "OneDrive availability could not be checked for these users: {emails}. "
-        "This may be a transient error; they will be picked up by a later sync if the issue resolves.",
-    ),
 }
 
 
@@ -585,6 +618,34 @@ class OneDriveConnector(BaseConnector):
         # Per drive, UniqueId -> item id of items written as inheriting on a full read's answer.
         self._inheriting_from_full_read: dict[str, dict[str, str]] = {}
         self._reset_permission_scopes()
+        self._deleted_groups: set[str] = set()
+        self._page_deleted_ids: set[str] = set()
+        # Users whose OneDrive was read again this run after its delta token expired, for the notice.
+        self._read_again: list[str] = []
+        self._user_emails: dict[str, str] = {}
+        self._health = RunHealth()
+        # Accounts that can't sign in (disabled, or gone from the tenant): no grant is written for them.
+        self._inactive_emails: set[str] = set()
+        # Accounts active again: their grants, removed while they were not, are written back this run.
+        self._returning_emails: set[str] = set()
+        # Set when Microsoft won't report sharing changes to this app: access is then re-read daily.
+        self._user_status = UserStatusTracker(self.user_sync_point)
+        self._notices = OneDriveNotices(
+            self.notify, self._notification_title,
+            lambda: {"connector_id": self.connector_id, "connector_name": self.display_name,
+                     "connector_scope": self.scope},
+            lambda: [self.created_by],
+        )
+        drives_key = generate_record_sync_point_key("knownDrives", "connector", "users")
+        self._drives = DriveRegistry(
+            lambda: self.drive_delta_sync_point.read_sync_point(drives_key),
+            lambda data: self.drive_delta_sync_point.update_sync_point(drives_key, data),
+        )
+        self._folder_access: dict[str, FolderAccess] = {}
+        self._nesting = GroupNesting(
+            lambda: self.user_group_sync_point.read_sync_point(self._groups_sync_point_key()),
+            lambda data: self.user_group_sync_point.update_sync_point(self._groups_sync_point_key(), data),
+        )
 
     async def init(self) -> bool:
         config = await self.config_service.get_config(f"/services/connectors/{self.connector_id}/config")
@@ -607,20 +668,7 @@ class OneDriveConnector(BaseConnector):
             self.logger.info("✅ Credential initialized and HTTP session established")
         except Exception as token_error:
             self.logger.error(f"❌ Failed to initialize credential: {token_error}")
-            await self.notify(
-                type=NotificationType.CONNECTOR_AUTH_ERROR,
-                severity=NotificationSeverity.ERROR,
-                title="OneDrive authentication failed",
-                message=(
-                    "Unable to authenticate using current credentials. Please verify the connector authentication credentials."
-                ),
-                payload={
-                    "connector_id": self.connector_id,
-                    "connector_name": self.connector_name.value,
-                    "connector_scope": self.scope,
-                },
-                recipient_user_ids=[self.created_by],
-            )
+            await self._notices.sign_in_failed()
             raise ValueError(f"Failed to initialize OneDrive credential: {sanitize_azure_error(token_error)}")
 
         self.client = GraphServiceClient(self.credential, scopes=["https://graph.microsoft.com/.default"])
@@ -766,7 +814,7 @@ class OneDriveConnector(BaseConnector):
             outcome = await self.notify_and_wait(
                 type=NotificationType.CONNECTOR_INFO,
                 severity=NotificationSeverity.INFO,
-                title="OneDrive: switch to certificate sign-in",
+                title=self._notification_title("switch to certificate sign-in"),
                 message=(
                     "Recommended: upload a client certificate and its private key on the connector, and grant the "
                     "app the Sites.Read.All application permission of the SharePoint API. The connector page links "
@@ -774,7 +822,7 @@ class OneDriveConnector(BaseConnector):
                 ),
                 payload={
                     "connector_id": self.connector_id,
-                    "connector_name": self.connector_name.value,
+                    "connector_name": self.display_name,
                     "connector_scope": self.scope,
                 },
                 recipient_user_ids=[self.created_by],
@@ -797,7 +845,7 @@ class OneDriveConnector(BaseConnector):
         await self.notify(
             type=NotificationType.CONNECTOR_WARNING,
             severity=NotificationSeverity.WARNING,
-            title="OneDrive can't read inherited permissions",
+            title=self._notification_title("can't read inherited permissions"),
             message=(
                 "SharePoint refused the app. Grant it the Sites.Read.All application permission of the SharePoint "
                 "API with admin consent, and check that the certificate uploaded to the connector is registered on "
@@ -805,7 +853,7 @@ class OneDriveConnector(BaseConnector):
             ),
             payload={
                 "connector_id": self.connector_id,
-                "connector_name": self.connector_name.value,
+                "connector_name": self.display_name,
                 "connector_scope": self.scope,
             },
             recipient_user_ids=[self.created_by],
@@ -815,14 +863,14 @@ class OneDriveConnector(BaseConnector):
         await self.notify(
             type=NotificationType.CONNECTOR_WARNING,
             severity=NotificationSeverity.WARNING,
-            title="OneDrive can't read inherited permissions",
+            title=self._notification_title("can't read inherited permissions"),
             message=(
                 "SharePoint denied the app access to OneDrive sites. Grant the app the Sites.Read.All application "
                 "permission of the SharePoint API (not Microsoft Graph) with admin consent."
             ),
             payload={
                 "connector_id": self.connector_id,
-                "connector_name": self.connector_name.value,
+                "connector_name": self.display_name,
                 "connector_scope": self.scope,
             },
             recipient_user_ids=[self.created_by],
@@ -919,13 +967,11 @@ class OneDriveConnector(BaseConnector):
                     permissions_changed=False
                 )
 
-            if not self._pass_date_filters(item):
-                self.logger.debug(f"Skipping item {item.name} (ID: {item.id}) due to date filters.")
-                return None
-
-            if not self._pass_extension_filter(item):
-                self.logger.debug(f"Skipping item {item.name} (ID: {item.id}) due to extention filters.")
-                return None
+            if not (self._pass_date_filters(item) and self._pass_extension_filter(item) and _has_extension(item)):
+                # Out of the sync's scope now. A file synced before (renamed out of the extension filter, edited out
+                # of the date window, renamed to a name without an extension) leaves PipesHub: this listing is the
+                # definite answer, and it is listed only once.
+                return await self._out_of_scope(item)
 
             # Get existing record if any
             existing_record = await self.data_entities_processor.get_record_by_external_id(
@@ -973,14 +1019,8 @@ class OneDriveConnector(BaseConnector):
                             content_changed = True
                             is_updated = True
 
-            # Create/update file record
-            signed_url = None
-            if item.file is not None:
-                signed_url = await self.msgraph_client.get_signed_url(
-                    item.parent_reference.drive_id,
-                    item.id,
-                )
-
+            # No download URL here: it is a bearer link that expires in about an hour, and fetching one costs a
+            # Graph call per file. Indexing and preview stream through the connector, which fetches one then.
             is_shared = hasattr(item, 'shared') and item.shared is not None
 
             file_record = FileRecord(
@@ -1000,7 +1040,6 @@ class OneDriveConnector(BaseConnector):
                 source_created_at=int(item.created_date_time.timestamp() * 1000),
                 source_updated_at=int(item.last_modified_date_time.timestamp() * 1000),
                 weburl=item.web_url,
-                signed_url=signed_url,
                 is_shared=is_shared,
                 mime_type=item.file.mime_type if item.file else MimeTypes.FOLDER.value,
                 parent_external_record_id=item.parent_reference.id if item.parent_reference else None,
@@ -1016,8 +1055,6 @@ class OneDriveConnector(BaseConnector):
                 sha1_hash=item.file.hashes.sha1_hash if item.file and item.file.hashes else None,
                 sha256_hash=item.file.hashes.sha256_hash if item.file and item.file.hashes else None,
             )
-            if file_record.is_file and file_record.extension is None:
-                return None
 
             permission_failure = None
             # An item that inherits has no grants of its own: Graph would list its parent's.
@@ -1068,11 +1105,18 @@ class OneDriveConnector(BaseConnector):
                     CollectionNames.RECORDS.value, existing_record.id if existing_record else None
                 )
 
-            if existing_record and existing_record.is_shared != is_shared_folder:
+            shared_changed = bool((getattr(item, 'additional_data', None) or {}).get("@microsoft.graph.sharedChanged"))
+            folder_access = None
+            access_changed = False
+            if item.folder is not None and permission_failure is None and item.parent_reference:
+                folder_access = await self._folder_access_of(item.parent_reference.drive_id)
+                access_changed = folder_access.changed(item.id, new_permissions) is True
+            if existing_record and (existing_record.is_shared != is_shared_folder
+                                    or (item.folder is not None and (shared_changed or access_changed))):
                 metadata_changed = True
                 is_updated = True
                 if item.folder is not None:
-                    # The walk runs only when the shared flag flips; saving the folder now
+                    # The walk runs only when the folder's sharing changed; saving the folder now
                     # would stop it from ever running again for the files it missed.
                     if permission_failure and not permission_failure.permanent and hold_page_on_incomplete_walk:
                         raise DrivePageIncompleteError(f"access of folder {item.id} could not be read")
@@ -1095,7 +1139,14 @@ class OneDriveConnector(BaseConnector):
                             "and are read again on later runs until it can be read."
                         )
                     elif not walk.complete:
-                        await self._settle_unread_children(walk, item.id, new_permissions, unshared=existing_record.is_shared)
+                        # A sharing change that kept the flag may have removed someone: settled as an unshare.
+                        await self._settle_unread_children(
+                            walk, item.id, new_permissions,
+                            unshared=existing_record.is_shared and (not is_shared_folder or shared_changed
+                                                                    or access_changed),
+                        )
+            if folder_access is not None:
+                folder_access.remember(item.id, new_permissions)
 
 
             return RecordUpdate(
@@ -1116,7 +1167,24 @@ class OneDriveConnector(BaseConnector):
             self.logger.error(f"❌ Error processing delta item {item.id}: {ex}", exc_info=True)
             # Whatever access it has stored is read again, so a rewrite of the drive can't skip it.
             self._queue_unknown_inheritance(item.parent_reference.drive_id if item.parent_reference else None, item.id)
+            if hold_page_on_incomplete_walk:
+                # Delta lists a change once: skipped here, the item would never be synced. The page is read again,
+                # a bounded number of times (MAX_PAGE_ATTEMPTS).
+                raise DrivePageIncompleteError(f"item {item.id} could not be processed: {ex}") from ex
             return None
+
+    async def _out_of_scope(self, item: DriveItem) -> Optional[RecordUpdate]:
+        """A listed item the sync filters leave out: removes its stored record, if there is one."""
+        if item.folder is not None:
+            return None
+        existing = await self.data_entities_processor.get_record_by_external_id(self.connector_id, item.id)
+        if existing is None:
+            self.logger.debug(f"Skipping item {item.name} (ID: {item.id}): outside the sync filters")
+            return None
+        self.logger.info(f"Item {item.id} ({item.name}) left the sync filters; removing its record")
+        return RecordUpdate(record=None, external_record_id=item.id, is_new=False, is_updated=False,
+                            is_deleted=True, metadata_changed=False, content_changed=False,
+                            permissions_changed=False)
 
     async def _convert_to_permissions(self, msgraph_permissions: List) -> List[Permission]:
         """
@@ -1126,54 +1194,76 @@ class OneDriveConnector(BaseConnector):
         permissions = []
 
         for perm in msgraph_permissions:
+            permissions.extend(self._permissions_of(perm))
+        for p in permissions:
+            if p.entity_type == EntityType.USER and not p.email and p.external_id:
+                # Graph shows no email for a user without a mailbox (an unlicensed user, for one), and a grant
+                # without one is dropped downstream: name them as the user list does (mail, else UPN).
+                p.email = await self._email_of_user(p.external_id)
+        return [p for p in permissions if p.entity_type != EntityType.USER or self._can_sign_in(p.email)]
+
+    async def _email_of_user(self, user_id: str) -> str | None:
+        if user_id not in self._user_emails:
             try:
-                # Handle user permissions
-                if hasattr(perm, 'granted_to_v2') and perm.granted_to_v2:
-                    if hasattr(perm.granted_to_v2, 'user') and perm.granted_to_v2.user:
-                        user = perm.granted_to_v2.user
-                        permissions.append(Permission(
-                            external_id=user.id,
-                            email=user.additional_data.get("email", None) if hasattr(user, 'additional_data') else None,
-                            type=map_msgraph_roles_to_permission_type(perm.roles),
-                            entity_type=EntityType.USER
-                        ))
-                    if hasattr(perm.granted_to_v2, 'group') and perm.granted_to_v2.group:
-                        group = perm.granted_to_v2.group
+                email = await self.msgraph_client.get_user_email(user_id)
+            except Exception as e:  # the grant stays without an email, as before
+                self.logger.warning(f"Could not read the email of user {user_id}: {e}")
+                return None
+            if not email:
+                return None
+            self._user_emails[user_id] = email
+        return self._user_emails[user_id]
+
+    def _permissions_of(self, perm: Any) -> List[Permission]:
+        """The grants one Graph permission gives: its user, its group, the people a link lists."""
+        permissions: List[Permission] = []
+        try:
+            # Handle user permissions
+            if hasattr(perm, 'granted_to_v2') and perm.granted_to_v2:
+                if hasattr(perm.granted_to_v2, 'user') and perm.granted_to_v2.user:
+                    user = perm.granted_to_v2.user
+                    permissions.append(Permission(
+                        external_id=user.id,
+                        email=user.additional_data.get("email", None) if hasattr(user, 'additional_data') else None,
+                        type=map_msgraph_roles_to_permission_type(perm.roles),
+                        entity_type=EntityType.USER
+                    ))
+                if hasattr(perm.granted_to_v2, 'group') and perm.granted_to_v2.group:
+                    group = perm.granted_to_v2.group
+                    permissions.append(Permission(
+                        external_id=group.id,
+                        email=group.additional_data.get("email", None) if hasattr(group, 'additional_data') else None,
+                        type=map_msgraph_roles_to_permission_type(perm.roles),
+                        entity_type=EntityType.GROUP
+                    ))
+
+
+            # Handle group permissions
+            if hasattr(perm, 'granted_to_identities_v2') and perm.granted_to_identities_v2:
+                for identity in perm.granted_to_identities_v2:
+                    if hasattr(identity, 'group') and identity.group:
+                        group = identity.group
                         permissions.append(Permission(
                             external_id=group.id,
                             email=group.additional_data.get("email", None) if hasattr(group, 'additional_data') else None,
                             type=map_msgraph_roles_to_permission_type(perm.roles),
                             entity_type=EntityType.GROUP
                         ))
+                    elif hasattr(identity, 'user') and identity.user:
+                        user = identity.user
+                        permissions.append(Permission(
+                            external_id=user.id,
+                            email=user.additional_data.get("email", None) if hasattr(user, 'additional_data') else None,
+                            type=map_msgraph_roles_to_permission_type(perm.roles),
+                            entity_type=EntityType.USER
+                        ))
 
+            # A link grants only the identities Graph lists on it. An organization or
+            # anonymous link opens the item only to the people who redeem it, and Graph
+            # does not list them, so they get no grant here: under-shared, never over-shared.
 
-                # Handle group permissions
-                if hasattr(perm, 'granted_to_identities_v2') and perm.granted_to_identities_v2:
-                    for identity in perm.granted_to_identities_v2:
-                        if hasattr(identity, 'group') and identity.group:
-                            group = identity.group
-                            permissions.append(Permission(
-                                external_id=group.id,
-                                email=group.additional_data.get("email", None) if hasattr(group, 'additional_data') else None,
-                                type=map_msgraph_roles_to_permission_type(perm.roles),
-                                entity_type=EntityType.GROUP
-                            ))
-                        elif hasattr(identity, 'user') and identity.user:
-                            user = identity.user
-                            permissions.append(Permission(
-                                external_id=user.id,
-                                email=user.additional_data.get("email", None) if hasattr(user, 'additional_data') else None,
-                                type=map_msgraph_roles_to_permission_type(perm.roles),
-                                entity_type=EntityType.USER
-                            ))
-
-                # A link grants only the identities Graph lists on it. An organization or
-                # anonymous link opens the item only to the people who redeem it, and Graph
-                # does not list them, so they get no grant here: under-shared, never over-shared.
-
-            except Exception as e:
-                self.logger.error(f"❌ Error converting permission: {e}", exc_info=True)
-                continue
+        except Exception as e:
+            self.logger.error(f"❌ Error converting permission: {e}", exc_info=True)
 
         return permissions
 
@@ -1459,6 +1549,31 @@ class OneDriveConnector(BaseConnector):
             "Reindex them to restore that."
         )
 
+    async def _delete_descendants_gone(self, folder: Record) -> None:
+        """Before a deleted folder's record goes, the stored records under it that Graph confirms are gone go too.
+
+        Graph may report a deleted folder alone (behaviour reports vary), and the processor's single delete
+        re-points the children at the folder's parent, where they would stay searchable. Each one is asked for
+        (404 = gone): a child moved out before the delete is still there, and its own change moves its record.
+        """
+        descendants = await self._stored_descendants(folder.external_record_id)
+        for record in reversed(descendants):
+            if record.external_record_id in self._page_deleted_ids:
+                continue
+            if await self._item_gone(record.external_record_group_id, record.external_record_id):
+                await self.data_entities_processor.on_record_deleted(record_id=record.id)
+
+    async def _item_gone(self, drive_id: str | None, item_id: str) -> bool:
+        """True only when Graph answers 404 for the item; any other failure raises, so nothing is removed on it."""
+        try:
+            async with self.msgraph_client.rate_limiter:
+                await self.client.drives.by_drive_id(drive_id).items.by_drive_item_id(item_id).get()
+        except ODataError as e:
+            if e.response_status_code == HTTPStatus.NOT_FOUND:
+                return True
+            raise
+        return False
+
     async def _stored_descendants(self, folder_id: str) -> list[Record]:
         # get_records_by_parent returns base Records, which carry no is_file, so every
         # child is looked up in turn; a file simply has no children.
@@ -1486,6 +1601,7 @@ class OneDriveConnector(BaseConnector):
                     self.connector_id, record_update.external_record_id
                 )
                 if dbRecord:
+                    await self._delete_descendants_gone(dbRecord)
                     await self.data_entities_processor.on_record_deleted(
                         record_id=dbRecord.id
                     )
@@ -1517,6 +1633,13 @@ class OneDriveConnector(BaseConnector):
                 self._queue_unknown_inheritance(
                     record_update.record.external_record_group_id, record_update.record.external_record_id
                 )
+            # Delta lists a change once: the caller reads the page again rather than lose it.
+            raise
+
+    def _groups_sync_point_key(self) -> str:
+        return generate_record_sync_point_key(
+            SyncDataPointType.GROUPS.value, "organization", self.data_entities_processor.org_id
+        )
 
     async def _sync_user_groups(self) -> None:
         """
@@ -1524,12 +1647,44 @@ class OneDriveConnector(BaseConnector):
         - First sync: Uses standard /groups API for clean current state
         - Subsequent syncs: Uses Graph Delta API for incremental changes
         """
+        await self._nesting.load()
+        self._deleted_groups: set[str] = set()
         try:
-            sync_point_key = generate_record_sync_point_key(
-                SyncDataPointType.GROUPS.value,
-                "organization",
-                self.data_entities_processor.org_id
-            )
+            await self._sync_user_groups_steps()
+        finally:
+            for group_id in self._deleted_groups:
+                self._nesting.forget(group_id)
+            await self._nesting.save()
+
+    async def _sync_user_groups_steps(self) -> None:
+        try:
+            await self._sync_user_groups_from_checkpoint()
+            key = self._groups_sync_point_key()
+            transitive = (await self.user_group_sync_point.read_sync_point(key) or {}).get("membersTransitive")
+            if self._returning_emails or not transitive:
+                # Returning users: their memberships were removed while they could not sign in, and no group
+                # changed since. No marker: groups were stored by a version that read one level of nesting only.
+                self.logger.info("Reading every group again with its members at any depth")
+                update: dict[str, Any] = {"membersTransitive": True}
+                if not await self._perform_initial_full_sync():
+                    # The groups that could not be read keep their stored members and are read again by the
+                    # bounded full-group retry, as after a first sync that missed some.
+                    update.update({"fullSyncIncomplete": True, "fullSyncAttempts": 1})
+                await self.user_group_sync_point.update_sync_point(key, update)
+        except ODataError as e:
+            if not _delta_token_expired(e):
+                raise
+            # Graph no longer honours the group delta link (tokens of directory objects expire): start over with a
+            # full read of every group, as a first sync does. Kept, the dead link would fail every run.
+            self.logger.warning(f"⚠️ The group delta token expired ({sanitize_graph_error(e)}); reading every group again")
+            await self.user_group_sync_point.update_sync_point(self._groups_sync_point_key(), {
+                "deltaLink": None, "nextLink": None, "heldPage": None, "heldPageAttempts": 0,
+            })
+            await self._sync_user_groups_from_checkpoint()
+
+    async def _sync_user_groups_from_checkpoint(self) -> None:
+        try:
+            sync_point_key = self._groups_sync_point_key()
             sync_point = await self.user_group_sync_point.read_sync_point(sync_point_key)
             if sync_point and sync_point.get('pendingGroupDeletes'):
                 await self._retry_pending_group_deletes(sync_point['pendingGroupDeletes'], sync_point_key)
@@ -1558,6 +1713,7 @@ class OneDriveConnector(BaseConnector):
                             "deltaLink": delta_link,
                             "fullSyncIncomplete": not all_groups_read,
                             "fullSyncAttempts": 0 if all_groups_read else 1,
+                            "membersTransitive": True,
                         }
                     )
                     self.logger.info("Initial sync completed and delta link saved for future syncs")
@@ -1571,7 +1727,7 @@ class OneDriveConnector(BaseConnector):
                 attempts = int(sync_point.get('fullSyncAttempts') or 1) + 1
                 if all_groups_read:
                     await self.user_group_sync_point.update_sync_point(
-                        sync_point_key, {"fullSyncIncomplete": False, "fullSyncAttempts": 0}
+                        sync_point_key, {"fullSyncIncomplete": False, "fullSyncAttempts": 0, "membersTransitive": True}
                     )
                 elif attempts >= MAX_PAGE_ATTEMPTS:
                     self.logger.error(
@@ -1597,11 +1753,11 @@ class OneDriveConnector(BaseConnector):
                 await self.notify(
                     type=NotificationType.CONNECTOR_AUTH_ERROR,
                     severity=NotificationSeverity.ERROR,
-                    title="User group sync failed",
+                    title=self._notification_title("user group sync failed"),
                     message="Please check your authentication credentials are correct and has Group.Read.All API permission.",
                     payload={
                         "connector_id": self.connector_id,
-                        "connector_name": self.connector_name.value,
+                        "connector_name": self.display_name,
                         "connector_scope": self.scope,
                     },
                     recipient_user_ids=[self.created_by],
@@ -1713,36 +1869,54 @@ class OneDriveConnector(BaseConnector):
 
     async def _collect_group_users(self, group: Group) -> list[AppUser]:
         """
-        Users in a group, including those of nested groups (one level deep).
+        The users of a group at any depth, as SharePoint opens a share with a security group to the members of the
+        groups nested in it. Devices, service principals and contacts are skipped. The groups found nested in it
+        are recorded, so a later change inside one of them reads this group again.
 
-        Supported member types:
-        - User: Added directly
-        - Group (nested): Fetch its users and add them (only one level deep)
-        - Device, Service Principal, Org Contact: Ignored
-
-        Raises GraphReadFailedError when the group's members, or a nested group's,
-        can't be read: saving a partial list would replace the group's stored members.
+        Raises GraphReadFailedError when the members can't be read: saving a partial list would replace the
+        group's stored members.
         """
         try:
-            members = await self.msgraph_client.get_group_members(group.id, raise_on_error=True)
+            members = await self.msgraph_client.get_group_transitive_members(group.id)
         except Exception as e:
             raise _read_failure(f"members of group {group.id}", e) from e
 
-        app_users = []
+        app_users: list[AppUser] = []
+        nested: set[str] = set()
+        seen: set[str] = set()
         for member in members:
             odata_type = getattr(member, 'odata_type', None) or (member.additional_data or {}).get('@odata.type', '')
-
             if '#microsoft.graph.user' in odata_type:
                 app_user = self._create_app_user_from_member(member)
-                if app_user:
+                if app_user and not self._can_sign_in(app_user.email):
+                    continue
+                if app_user and app_user.source_user_id not in seen:
+                    seen.add(app_user.source_user_id)
                     app_users.append(app_user)
-            elif '#microsoft.graph.group' in odata_type:
-                app_users.extend(await self._get_users_from_nested_group(member))
+            elif '#microsoft.graph.group' in odata_type and member.id:
+                nested.add(member.id)
             else:
                 self.logger.debug(f"Skipping member type '{odata_type}' for member {member.id}")
-
+        self._nesting.record(group.id, nested)
         return app_users
 
+    async def _reread_outer_groups(self, changed: set[str], handled: set[str]) -> list[str]:
+        """Read again the groups that contain a changed or deleted group; returns those that could not be read."""
+        failed: list[str] = []
+        outers = set().union(*(self._nesting.outer_groups(g) for g in changed)) if changed else set()
+        for outer_id in sorted(outers - handled):
+            try:
+                async with self.msgraph_client.rate_limiter:
+                    outer = await self.client.groups.by_group_id(outer_id).get()
+            except ODataError as e:
+                if e.response_status_code == HTTPStatus.NOT_FOUND:
+                    # Gone too; its own deletion comes through the delta.
+                    continue
+                failed.append(outer_id)
+                continue
+            if await self.handle_group_create(outer) is False:
+                failed.append(outer_id)
+        return failed
 
     async def _perform_delta_sync(self, url: str, sync_point_key: str) -> None:
         """
@@ -1764,7 +1938,11 @@ class OneDriveConnector(BaseConnector):
 
             unapplied: list[str] = []
             failed_deletes: list[str] = []
+            changed: set[str] = set()
+            saved: set[str] = set()
             for group in groups:
+                if group.id:
+                    changed.add(group.id)
                 # Handle group DELETION
                 if hasattr(group, 'additional_data') and group.additional_data and '@removed' in group.additional_data:
                     self.logger.info(f"[DELTA] 🗑️ REMOVE Group: {group.id}")
@@ -1777,11 +1955,12 @@ class OneDriveConnector(BaseConnector):
 
                 # Handle ADD/UPDATE
                 self.logger.info(f"[DELTA] ✅ ADD/UPDATE Group: {getattr(group, 'display_name', 'N/A')} ({group.id})")
-                saved = await self.handle_group_create(group)
-                if saved is False:
+                outcome = await self.handle_group_create(group)
+                if outcome is False:
                     self.logger.error(f"❌ Error handling group create for {group.id}")
                     unapplied.append(group.id)
-                if saved:
+                if outcome:
+                    saved.add(group.id)
                     # The saved list replaced the group's stored members and already leaves
                     # out anyone removed here, so there is nothing left to remove.
                     continue
@@ -1796,6 +1975,12 @@ class OneDriveConnector(BaseConnector):
                 for member_change in member_changes:
                     if not await self._process_member_change(group.id, member_change) and group.id not in unapplied:
                         unapplied.append(group.id)
+
+            # Graph reports a change on the group whose direct members changed; the groups around it hold its
+            # users too (GroupNesting).
+            for outer_id in await self._reread_outer_groups(changed, saved):
+                if outer_id not in unapplied:
+                    unapplied.append(outer_id)
 
             # Graph won't send this page again once the link moves past it, so a group
             # that couldn't be applied would lose its changes for good. A page is held
@@ -1925,41 +2110,6 @@ class OneDriveConnector(BaseConnector):
         self.logger.info(f"Processed group creation/update for: {group.display_name} with {len(app_users)} user members")
 
 
-    async def _get_users_from_nested_group(self, nested_group) -> List[AppUser]:
-        """
-        Fetches users from a nested group (one level deep only).
-
-        Args:
-            nested_group: A group member object from Microsoft Graph API
-
-        Returns:
-            List of AppUser entities from the nested group
-
-        Raises:
-            GraphReadFailedError: if the nested group's members can't be read
-        """
-        nested_group_name = getattr(nested_group, 'display_name', nested_group.id)
-        self.logger.info(f"Processing nested group member: {nested_group_name}")
-
-        try:
-            nested_members = await self.msgraph_client.get_group_members(nested_group.id, raise_on_error=True)
-        except Exception as e:
-            raise _read_failure(f"members of nested group {nested_group_name}", e) from e
-
-        app_users = []
-        for nested_member in nested_members:
-            nested_odata_type = getattr(nested_member, 'odata_type', None) or (nested_member.additional_data or {}).get('@odata.type', '')
-
-            if '#microsoft.graph.user' in nested_odata_type:
-                app_user = self._create_app_user_from_member(nested_member)
-                if app_user:
-                    app_users.append(app_user)
-            else:
-                self.logger.debug(f"Skipping non-user member '{nested_odata_type}' in nested group {nested_group_name}")
-
-        return app_users
-
-
     def _create_app_user_from_member(self, member) -> Optional[AppUser]:
         """
         Helper method to create an AppUser from a Graph API user member.
@@ -2009,6 +2159,7 @@ class OneDriveConnector(BaseConnector):
                 self.logger.error(f"❌ Error handling group delete for {group_id}")
                 return False
 
+            self._deleted_groups.add(group_id)
             return True
 
         except Exception as e:
@@ -2061,14 +2212,14 @@ class OneDriveConnector(BaseConnector):
                             description=f"OneDrive for {display_name or user_email}",
                         )
 
-                        owner_permission = Permission(
+                        owner_permissions = [Permission(
                             email=user_email,
                             type=PermissionType.OWNER,
                             entity_type=EntityType.USER
-                        )
+                        )] if self._can_sign_in(user_email) else []
 
                         # Save the RecordGroup
-                        await self.data_entities_processor.on_new_record_groups([(record_group, [owner_permission])])
+                        await self.data_entities_processor.on_new_record_groups([(record_group, owner_permissions)])
                         self.logger.info(f"Created RecordGroup for user {user_id} with drive ID {drive.id}")
                     else:
                         self.logger.warning(f"Could not fetch user info for {user_id}, skipping RecordGroup creation")
@@ -2083,9 +2234,9 @@ class OneDriveConnector(BaseConnector):
             # Graph answers a delta link with the sharing-changes preference only if the link was made
             # with it (410 Resync required otherwise), so the preference follows the link.
             sharing_changes = bool(sync_point and sync_point.get("sharingChanges"))
-            if enumerates_drive and self.scope_reader is not None:
-                sharing_changes = True
-                await self.drive_delta_sync_point.update_sync_point(sync_point_key, {"sharingChanges": True})
+            if enumerates_drive:
+                sharing_changes = REQUEST_SHARING_CHANGES
+                await self.drive_delta_sync_point.update_sync_point(sync_point_key, {"sharingChanges": sharing_changes})
 
             drive_id = await self._user_drive_id(user_id)
             permission_state: dict[str, Any] = {}
@@ -2109,20 +2260,31 @@ class OneDriveConnector(BaseConnector):
                     except Exception as e:
                         self.logger.warning(f"⚠️ Could not read again the access of queued items of OneDrive {drive_id}: {e}")
 
-                pending_access = await self._sync_delta_pages(
-                    user_id,
-                    url,
-                    _DeltaCursor(
-                        key=sync_point_key,
-                        next_field="nextLink",
-                        held_field="heldPage",
-                        held_attempts_field="heldPageAttempts",
-                        delta_field="deltaLink",
-                        state=sync_point or {},
-                    ),
-                    pending_access,
-                    show_sharing_changes=sharing_changes,
-                )
+                if sync_point and sync_point.get("resyncPending"):
+                    pending_access = await self._read_drive_again(user_id, drive_id, sync_point_key, pending_access)
+                else:
+                    try:
+                        pending_access = await self._sync_delta_pages(
+                            user_id,
+                            url,
+                            _DeltaCursor(
+                                key=sync_point_key,
+                                next_field="nextLink",
+                                held_field="heldPage",
+                                held_attempts_field="heldPageAttempts",
+                                delta_field="deltaLink",
+                                state=sync_point or {},
+                            ),
+                            pending_access,
+                            show_sharing_changes=sharing_changes,
+                        )
+                    except ODataError as e:
+                        if not _delta_token_expired(e) or enumerates_drive:
+                            raise
+                        pending_access = await self._read_drive_again(user_id, drive_id, sync_point_key, pending_access)
+
+                if self._returning_emails:
+                    pending_access = await self._rewrite_drive_access(user_id, pending_access)
 
                 if drive_id:
                     await self._verify_scanned_inheritance(drive_id)
@@ -2130,6 +2292,7 @@ class OneDriveConnector(BaseConnector):
             finally:
                 if drive_id:
                     self._forget_drive_scope(drive_id)
+                    await self._save_folder_access(drive_id)
                     try:
                         await self._save_items_without_known_inheritance(drive_id)
                     except Exception as e:
@@ -2141,8 +2304,61 @@ class OneDriveConnector(BaseConnector):
             self.logger.error(f"❌ Error in delta sync for user {user_id}: {ex}")
             raise
 
+    async def _rewrite_drive_access(self, user_id: str, pending_access: list[str]) -> list[str]:
+        """Read every item of the drive once more and rewrite its access: for accounts that came back (their grants
+        were removed while they could not sign in).
+
+        The drive's own delta link stays where it is (the pass's link is thrown away); an interrupted pass resumes
+        from its own next link. Content isn't re-indexed: an unchanged item is only rewritten for its access.
+        """
+        self.logger.info(f"Re-reading the access of every item of user {user_id}'s OneDrive")
+        key = generate_record_sync_point_key("accessRewrite", "users", user_id)
+        state = await self.drive_delta_sync_point.read_sync_point(key) or {}
+        start = state.get("nextLink") or ("{+baseurl}" + f"/users/{user_id}/drive/root/delta")
+        return await self._sync_delta_pages(
+            user_id, start,
+            _DeltaCursor(key=key, next_field="nextLink", held_field="heldPage",
+                         held_attempts_field="heldPageAttempts", delta_field=None, state=state),
+            pending_access,
+            show_sharing_changes=REQUEST_SHARING_CHANGES,
+        )
+
+    async def _read_drive_again(
+        self, user_id: str, drive_id: str | None, sync_point_key: str, pending_access: list[str]
+    ) -> list[str]:
+        """Graph no longer honours the drive's delta token (410 resyncRequired): list the whole drive again.
+
+        A fresh listing reports no deletions, so afterwards the stored records it did not list are removed, each
+        only once Graph answers 404 for it (DriveReconciler). Until that has run to the end the drive is marked,
+        and an interrupted run starts the listing over: what it saw is not kept across runs.
+        """
+        self.logger.warning(f"⚠️ The delta token of user {user_id}'s OneDrive expired; reading the drive again")
+        await self.drive_delta_sync_point.update_sync_point(sync_point_key, {
+            "deltaLink": None, "nextLink": None, "heldPage": None, "heldPageAttempts": 0,
+            "sharingChanges": REQUEST_SHARING_CHANGES, "resyncPending": True,
+        })
+        listed: set[str] = set()
+        pending_access = await self._sync_delta_pages(
+            user_id,
+            "{+baseurl}" + f"/users/{user_id}/drive/root/delta",
+            _DeltaCursor(key=sync_point_key, next_field="nextLink", held_field="heldPage",
+                         held_attempts_field="heldPageAttempts", delta_field="deltaLink", state={}),
+            pending_access,
+            show_sharing_changes=REQUEST_SHARING_CHANGES,
+            listed=listed,
+        )
+        drive = drive_id or self._drives.drive_of(user_id)
+        if drive:
+            await DriveReconciler(self.data_entities_processor, self.connector_id, self.logger).remove_unlisted(
+                drive, listed, lambda external_id: self._item_gone(drive, external_id)
+            )
+        await self.drive_delta_sync_point.update_sync_point(sync_point_key, {"resyncPending": False})
+        self._read_again.append(self._user_emails.get(user_id, user_id))
+        return pending_access
+
     async def _sync_delta_pages(
-        self, user_id: str, url: str, cursor: "_DeltaCursor", pending_access: list[str], *, show_sharing_changes: bool = False
+        self, user_id: str, url: str, cursor: "_DeltaCursor", pending_access: list[str], *,
+        show_sharing_changes: bool = False, listed: set[str] | None = None,
     ) -> list[str]:
         """Read a drive's delta pages from ``url`` and apply them; returns the items whose access is still to be read."""
         sync_point_key = generate_record_sync_point_key(RecordType.DRIVE.value, "users", user_id)
@@ -2184,36 +2400,46 @@ class OneDriveConnector(BaseConnector):
                     sync_point_key, sync_point_data={"pendingAccessReads": pending_access}
                 )
 
-            for file_record, permissions, record_update in processed:
-                if record_update.is_deleted:
-                    # Handle deletion immediately
-                    await self._handle_record_updates(record_update)
-                    continue
+            if listed is not None:
+                listed.update(i.id for i in drive_items if i.id and getattr(i, 'deleted', None) is None)
+            self._page_deleted_ids = {
+                record_update.external_record_id for _, _, record_update in processed if record_update.is_deleted
+            }
+            try:
+                for file_record, permissions, record_update in processed:
+                    if record_update.is_deleted or record_update.is_updated:
+                        await self._handle_record_updates(record_update)
+                        continue
 
-                # Handle updates
-                if record_update.is_updated:
-                    await self._handle_record_updates(record_update)
-                    continue
+                    if file_record:
+                        batch_records.append((file_record, permissions))
+                        batch_count += 1
+                        if batch_count >= self.batch_size:
+                            await self.data_entities_processor.on_new_records(batch_records)
+                            batch_records = []
+                            batch_count = 0
+                            # Allow other operations to proceed
+                            await asyncio.sleep(0.1)
 
-                if file_record:
-                    # Add to batch
-                    batch_records.append((file_record, permissions))
-                    batch_count += 1
-
-                    # Process batch when it reaches the size limit
-                    if batch_count >= self.batch_size:
-                        await self.data_entities_processor.on_new_records(batch_records)
-                        batch_records = []
-                        batch_count = 0
-
-                        # Allow other operations to proceed
-                        await asyncio.sleep(0.1)
-
-            # Process remaining records in batch
-            if batch_records:
-                await self.data_entities_processor.on_new_records(batch_records)
-                batch_records = []
-                batch_count = 0
+                if batch_records:
+                    await self.data_entities_processor.on_new_records(batch_records)
+                    batch_records = []
+                    batch_count = 0
+            except Exception as apply_error:
+                # The cursor has not moved past this page: delta lists each change once, so it is read again
+                # next run rather than lost, a bounded number of times.
+                if attempts_so_far + 1 >= MAX_PAGE_ATTEMPTS:
+                    self.logger.error(
+                        f"❌ A delta page of user {user_id}'s OneDrive still could not be saved after "
+                        f"{attempts_so_far + 1} attempts; moving past it: {apply_error}"
+                    )
+                    batch_records, batch_count = [], 0
+                else:
+                    await self.drive_delta_sync_point.update_sync_point(
+                        cursor.key,
+                        sync_point_data={cursor.held_field: url, cursor.held_attempts_field: attempts_so_far + 1},
+                    )
+                    raise DrivePageIncompleteError(f"a change could not be saved: {apply_error}") from apply_error
 
             # Update sync state with next_link
             next_link = result.get('next_link')
@@ -2321,7 +2547,7 @@ class OneDriveConnector(BaseConnector):
                     on_progress={"migrationFailures": 0},
                 ),
                 pending_access,
-                show_sharing_changes=True,
+                show_sharing_changes=REQUEST_SHARING_CHANGES,
             )
         except Exception as e:
             stored = await self.drive_delta_sync_point.read_sync_point(permission_key) or {}
@@ -2345,16 +2571,17 @@ class OneDriveConnector(BaseConnector):
     async def _adopt_sharing_changes_link(self, user_id: str, drive_id: str, pending_access: list[str]) -> None:
         """Make the rewrite's delta link the drive's, once the old link has been read to the end.
 
-        The rewrite asked for sharing changes; a link made without that can't be asked for
-        them. The old link is read once more first, so what changed or was deleted before
+        The rewrite's link is of the kind REQUEST_SHARING_CHANGES says; Graph honours a link only with
+        the preference it was made with, so a drive whose link is of the other kind takes the rewrite's.
+        The old link is read once more first, so what changed or was deleted before
         the rewrite started is not lost; what it reads again is applied twice, harmlessly.
         """
         user_key = generate_record_sync_point_key(RecordType.DRIVE.value, "users", user_id)
         permission_key = _drive_permissions_key(drive_id)
         new_link = (await self.drive_delta_sync_point.read_sync_point(permission_key) or {}).get("migrationDeltaLink")
         current = await self.drive_delta_sync_point.read_sync_point(user_key) or {}
-        if not new_link or current.get("sharingChanges"):
-            # The drive's own link already reports sharing changes: it stays, as it was read last.
+        if not new_link or bool(current.get("sharingChanges")) == REQUEST_SHARING_CHANGES:
+            # The drive's own link is already of the kind the rewrite made: it stays, as it was read last.
             await self.drive_delta_sync_point.update_sync_point(permission_key, {"migrationDeltaLink": None})
             return
         old_link = current.get("deltaLink") or current.get("nextLink")
@@ -2369,7 +2596,7 @@ class OneDriveConnector(BaseConnector):
                 pending_access,
             )
         await self.drive_delta_sync_point.update_sync_point(
-            user_key, {"deltaLink": new_link, "nextLink": None, "sharingChanges": True}
+            user_key, {"deltaLink": new_link, "nextLink": None, "sharingChanges": REQUEST_SHARING_CHANGES}
         )
         await self.drive_delta_sync_point.update_sync_point(permission_key, {"migrationDeltaLink": None})
 
@@ -2496,6 +2723,27 @@ class OneDriveConnector(BaseConnector):
         for item_id in remaining:
             self._queue_unknown_inheritance(drive_id, item_id)
 
+    async def _folder_access_of(self, drive_id: str) -> FolderAccess:
+        if drive_id not in self._folder_access:
+            key = generate_record_sync_point_key("folderAccess", "drives", drive_id)
+            access = FolderAccess(
+                lambda: self.drive_delta_sync_point.read_sync_point(key),
+                lambda data: self.drive_delta_sync_point.update_sync_point(key, data),
+            )
+            await access.load()
+            self._folder_access[drive_id] = access
+        return self._folder_access[drive_id]
+
+    async def _save_folder_access(self, drive_id: str) -> None:
+        access = self._folder_access.pop(drive_id, None)
+        if access is None:
+            return
+        try:
+            await access.save()
+        except Exception as e:
+            # Folders not remembered are taken as new next time: their files are not rewritten for that change.
+            self.logger.error(f"❌ Could not save the folder access of OneDrive {drive_id}: {e}")
+
     def _forget_drive_scope(self, drive_id: str) -> None:
         """Drop what SharePoint said about a drive; full-read answers not yet checked are queued instead."""
         self._drive_scopes.pop(drive_id, None)
@@ -2528,12 +2776,16 @@ class OneDriveConnector(BaseConnector):
 
     async def _process_users_in_batches(self, users: List[AppUser]) -> None:
         """
-        Process users in concurrent batches for improved performance.
+        Sync the OneDrive of every tenant user who is a PipesHub user.
+
+        A OneDrive that can't be read is recorded in the run's health, not swallowed: the run then fails, and a
+        full sync removes nothing (full_sync_coverage). The rest still sync.
 
         Args:
-            users: List of users to process
+            users: The tenant's complete user list
         """
         try:
+            await self._drives.load()
             all_active_users = await self.data_entities_processor.get_all_active_users()
             active_user_emails = {active_user.email.lower() for active_user in all_active_users}
 
@@ -2545,6 +2797,7 @@ class OneDriveConnector(BaseConnector):
 
             self.logger.info(f"Found {len(active_users)} active users out of {len(users)} total users")
 
+            self._user_emails = {u.source_user_id: u.email for u in users if u.email}
             users_to_sync = []
             failed_users: List[Tuple[str, OneDriveUserStatus]] = []
             for user in active_users:
@@ -2553,47 +2806,45 @@ class OneDriveConnector(BaseConnector):
                 except Exception as e:
                     self.logger.error(f"❌ Error checking OneDrive for user {user.email}, skipping: {e}", exc_info=True)
                     failed_users.append((user.email, OneDriveUserStatus.UNKNOWN_ERROR))
+                    self._health.skipped_drive(user.email, _error_text(e))
                     continue
 
                 if onedrive_status is OneDriveUserStatus.AVAILABLE:
                     users_to_sync.append(user)
-                else:
-                    failed_users.append((user.email, onedrive_status))
-                    self.logger.info(
-                        "Skipping user %s: OneDrive status is %s",
-                        user.email,
-                        onedrive_status.value,
-                    )
+                    continue
+                failed_users.append((user.email, onedrive_status))
+                self.logger.info(
+                    "Skipping user %s: OneDrive status is %s",
+                    user.email,
+                    onedrive_status.value,
+                )
+                if onedrive_status is OneDriveUserStatus.NOT_PROVISIONED:
+                    # 404: the OneDrive is gone (or never was); a drive synced before is removed.
+                    await self._remove_drive(user.source_user_id, "Graph answers 404 for it")
+                elif onedrive_status is OneDriveUserStatus.LOCKED:
+                    # 423: nobody can open it now, and it may be unlocked; its records stay as they are.
+                    await self._keep_drive(self._drives.drive_of(user.source_user_id))
 
-            await self._notify_onedrive_user_failures(failed_users)
+            await self._settle_departed_users({u.source_user_id for u in users})
+            await self._notify_onedrive_user_failures(
+                [(email, status) for email, status in failed_users if status is not OneDriveUserStatus.UNKNOWN_ERROR]
+            )
 
             self.logger.info(f"Processing {len(users_to_sync)} users with OneDrive out of {len(active_users)} active users")
             self.onedrive_users_synced = len(users_to_sync)
-            if len(users_to_sync) == 0:
-                await self.notify(
-                    type=NotificationType.CONNECTOR_RECORD_SYNC_ERROR,
-                    severity=NotificationSeverity.WARNING,
-                    title="No OneDrive users synced",
-                    message=(
-                        "Ensure that your OneDrive users are invited to Pipeshub, and verify that your application has Files.Read.All API permission with admin consent."
-                    ),
-                    payload={
-                        "connector_id": self.connector_id,
-                        "connector_name": self.connector_name.value,
-                        "connector_scope": self.scope,
-                    },
-                )
+            if len(users_to_sync) == 0 and not failed_users:
+                await self._notices.nobody_synced()
 
             # Process users in concurrent batches
             for i in range(0, len(users_to_sync), self.max_concurrent_batches):
                 batch = users_to_sync[i:i + self.max_concurrent_batches]
-
-                sync_tasks = [
-                    self._run_sync_with_yield(user.source_user_id)
-                    for user in batch
-                ]
-
-                await asyncio.gather(*sync_tasks, return_exceptions=True)
+                results = await asyncio.gather(
+                    *[self._run_sync_with_yield(user.source_user_id) for user in batch],
+                    return_exceptions=True,
+                )
+                for user, result in zip(batch, results):
+                    if isinstance(result, BaseException):
+                        self._health.skipped_drive(user.email, _error_text(result))
                 await asyncio.sleep(1)
 
             self.logger.info("Completed processing all user batches")
@@ -2601,6 +2852,11 @@ class OneDriveConnector(BaseConnector):
         except Exception as e:
             self.logger.error(f"❌ Error processing users in batches: {e}")
             raise
+        finally:
+            try:
+                await self._drives.save()
+            except Exception as e:
+                self.logger.error(f"❌ Could not save the known OneDrives: {e}")
 
     async def _notify_onedrive_user_failures(
         self,
@@ -2615,17 +2871,7 @@ class OneDriveConnector(BaseConnector):
             if len(emails) > 5:
                 displayed_emails = f"{displayed_emails}, and {len(emails) - 5} more"
 
-            await self.notify(
-                type=NotificationType.CONNECTOR_WARNING,
-                severity=NotificationSeverity.WARNING,
-                title=title,
-                message=message_template.format(emails=displayed_emails),
-                payload={
-                    "connector_id": self.connector_id,
-                    "connector_name": self.connector_name.value,
-                    "connector_scope": self.scope,
-                },
-            )
+            await self._notices.users_unavailable(title, message_template.format(emails=displayed_emails))
 
     async def _user_has_onedrive(self, user_id: str) -> OneDriveUserStatus:
         """
@@ -2642,6 +2888,7 @@ class OneDriveConnector(BaseConnector):
             drive_id = getattr(drive, 'id', None)
             if isinstance(drive_id, str) and drive_id:
                 self._user_drive_ids[user_id] = drive_id
+                self._drives.remember(user_id, drive_id)
             return OneDriveUserStatus.AVAILABLE
         except ODataError as e:
             error_message = str(e).lower()
@@ -2677,8 +2924,11 @@ class OneDriveConnector(BaseConnector):
         """
         try:
             users = await self.msgraph_client.get_all_users()
-            await self.data_entities_processor.on_new_app_users(users)
-            self.logger.info(f"✅ Successfully synced {len(users)} users")
+            enabled = [u for u in users if u.is_active is not False]
+            if enabled:
+                await self.data_entities_processor.on_new_app_users(enabled)
+            await self._apply_user_status(users)
+            self.logger.info(f"✅ Successfully synced {len(enabled)} users ({len(users) - len(enabled)} disabled)")
             return users
         except ODataError as e:
             self.logger.error(f"❌ Error syncing OneDrive users: {e}", exc_info=True)
@@ -2687,14 +2937,14 @@ class OneDriveConnector(BaseConnector):
                 await self.notify(
                     type=NotificationType.CONNECTOR_USER_SYNC_ERROR,
                     severity=NotificationSeverity.ERROR,
-                    title="OneDrive users sync failed",
+                    title=self._notification_title("users sync failed"),
                     message=(
                         "Please check your authentication credentials are correct and has User.Read.All API permission."
                     ),
                     recipient_user_ids=[self.created_by],
                     payload={
                         "connector_id": self.connector_id,
-                        "connector_name": self.connector_name.value,
+                        "connector_name": self.display_name,
                         "connector_scope": self.scope,
                     },
                 )
@@ -2702,6 +2952,73 @@ class OneDriveConnector(BaseConnector):
         except Exception as e:
             self.logger.error(f"❌ Error syncing OneDrive users: {e}", exc_info=True)
             raise
+
+    async def _apply_user_status(self, users: List[AppUser]) -> None:
+        """Take access away from accounts that can no longer sign in, and note the ones that came back.
+
+        A disabled account can't open anything in OneDrive, and one gone from the tenant isn't there to; their
+        PipesHub accounts would keep every grant this connector wrote. Reaching a team connector goes through
+        the org's team, so only removing the grants themselves takes the access away. `users` is the complete
+        listing (get_all_users raises on a page it can't read). The state is saved at the end of a run that
+        read everything (`_finish_run`), so a run that fails part-way repeats these changes.
+        """
+        change = await self._user_status.compare(users)
+        self._inactive_emails = change.inactive
+        self._returning_emails = change.restore
+        for email in sorted(change.withdraw):
+            removed = await self.data_entities_processor.remove_user_access_to_connector(self.connector_id, email)
+            self.logger.info(f"{email} can no longer sign in to OneDrive; removed {removed} grant(s)")
+
+    def _can_sign_in(self, email: str | None) -> bool:
+        return not email or email.lower() not in self._inactive_emails
+
+    async def _remove_drive(self, user_id: str, why: str) -> None:
+        """Remove a OneDrive that Microsoft says is gone, with every record in it, and forget its sync state."""
+        drive_id = self._drives.drive_of(user_id)
+        if not drive_id:
+            return
+        self.logger.info(f"Removing OneDrive {drive_id} of user {user_id}: {why}")
+        await self.data_entities_processor.on_record_group_deleted(drive_id, self.connector_id)
+        for key in (generate_record_sync_point_key(RecordType.DRIVE.value, "users", user_id),
+                    _drive_permissions_key(drive_id)):
+            await self.drive_delta_sync_point.delete_sync_point(key)
+        self._drives.forget(user_id)
+
+    async def _keep_drive(self, drive_id: str | None) -> None:
+        """A OneDrive this run leaves as stored (locked, or kept after its user left): a full sync in progress must
+        not unlink what it did not read."""
+        processor = self.data_entities_processor
+        if not drive_id or not processor.full_sync_running(self.connector_id):
+            return
+        await processor.note_kept_record_group(self.connector_id, drive_id)
+        after = None
+        while True:
+            page = await processor.get_records_in_record_group(self.connector_id, drive_id, 500, after_key=after)
+            processor.note_kept_records(self.connector_id, [r.id for r in page])
+            if len(page) < 500:
+                break
+            after = page[-1].id
+
+    async def _settle_departed_users(self, listed_user_ids: set[str]) -> None:
+        """OneDrives of users no longer in the tenant. Microsoft keeps a deleted user's OneDrive for a retention
+        period (30 days by default), during which what they shared stays open; it is removed here once Graph
+        answers 404 for it. Graph still answers for it by the user's id during retention (Microsoft Q&A, MEDIUM)."""
+        for user_id in sorted(self._drives.users() - listed_user_ids):
+            try:
+                drive = await self.msgraph_client.get_user_drive(user_id)
+            except ODataError as e:
+                if e.response_status_code == HTTPStatus.NOT_FOUND:
+                    await self._remove_drive(user_id, "its user left the tenant and the OneDrive is gone")
+                    continue
+                if e.response_status_code == 423:
+                    await self._keep_drive(self._drives.drive_of(user_id))
+                    continue
+                self._health.skipped(f"OneDrive of departed user {user_id}", sanitize_graph_error(e))
+                continue
+            except Exception as e:
+                self._health.skipped(f"OneDrive of departed user {user_id}", e)
+                continue
+            await self._keep_drive(getattr(drive, "id", None) or self._drives.drive_of(user_id))
 
     async def _handle_reindex_event(self, record_id: str) -> None:
         """
@@ -2796,6 +3113,8 @@ class OneDriveConnector(BaseConnector):
             await self._reinitialize_credential_if_needed()
             self.onedrive_users_synced = 0
             self._reset_permission_scopes()
+            self._health = RunHealth()
+            self._read_again = []
 
             self.sync_filters, self.indexing_filters = await load_connector_filters(
                 self.config_service, "onedrive", self.connector_id, self.logger
@@ -2814,26 +3133,48 @@ class OneDriveConnector(BaseConnector):
             self.logger.info("Syncing user drives...")
             await self._process_users_in_batches(users)
 
+            await self._finish_run()
             self.logger.info("OneDrive connector sync completed successfully")
-            if self.onedrive_users_synced > 0:
-                await self.notify(
-                    type=NotificationType.CONNECTOR_SUCCESS,
-                    severity=NotificationSeverity.INFO,
-                    title="OneDrive sync complete",
-                    message="OneDrive sync completed successfully",
-                    recipient_user_ids=[self.created_by],
-                    payload={
-                        "connector_id": self.connector_id,
-                        "connector_name": self.connector_name.value,
-                        "connector_scope": self.scope,
-                    },
-                )
 
         except Exception as e:
             self.logger.error(f"❌ Error in OneDrive connector run: {e}")
+            if isinstance(e, ODataError) and e.response_status_code == HTTPStatus.UNAUTHORIZED:
+                await self._token_refused(e)
             raise
         finally:
             await self._collect_action_items()
+
+    async def _token_refused(self, error: ODataError) -> None:
+        """Graph refused the token (revoked, or issued before the app's access was taken away). The credential
+        would keep handing out the same cached token until it expires, so it is dropped: the next run signs in
+        afresh, and a sign-in Microsoft refuses is reported there."""
+        self.logger.error(f"❌ Microsoft Graph refused the connector's token: {sanitize_graph_error(error)}")
+        await self._notices.sign_in_failed()
+        credential, self.credential = getattr(self, "credential", None), None
+        if credential is not None:
+            try:
+                await credential.close()
+            except Exception:
+                self.logger.debug("The refused credential did not close cleanly", exc_info=True)
+
+    async def _finish_run(self) -> None:
+        """Tell the admin once what this run skipped, and fail the run when it skipped anything: a run that
+        did not read part of the source must not be recorded as a success."""
+        if self._read_again:
+            await self._notices.drives_read_again(self._read_again)
+        if self._health.complete:
+            await self._user_status.save()
+            return
+        if self._health.skipped_users:
+            await self._notices.drives_skipped(self._health.skipped_users, self._health.summary(limit=2))
+        else:
+            await self._notices.part_skipped(self._health.summary(limit=3))
+        self._health.raise_if_incomplete()
+
+    @override
+    def full_sync_coverage(self) -> FullSyncCoverage:
+        """A full sync that skipped a OneDrive removes nothing: what it did not read is not known to be gone."""
+        return FullSyncCoverage(complete=self._health.complete)
 
     async def _reinitialize_credential_if_needed(self) -> None:
         """
@@ -2869,22 +3210,7 @@ class OneDriveConnector(BaseConnector):
             await self.credential.get_token("https://graph.microsoft.com/.default")
         except Exception as reinit_error:
             self.logger.error(f"❌ Failed to reinitialize OneDrive credential: {reinit_error}")
-            await self.notify(
-                type=NotificationType.CONNECTOR_AUTH_ERROR,
-                severity=NotificationSeverity.ERROR,
-                title="OneDrive authentication failed",
-                message=(
-                    "Unable to re-authenticate the OneDrive connector. "
-                    f"The client {'secret' if auth_config.get('clientSecret') else 'certificate'} may have expired. "
-                    "Please update the connector credentials."
-                ),
-                payload={
-                    "connector_id": self.connector_id,
-                    "connector_name": self.connector_name.value,
-                    "connector_scope": self.scope,
-                },
-                recipient_user_ids=[self.created_by],
-            )
+            await self._notices.sign_in_failed()
             raise
 
         # Recreate Graph client with new credential
@@ -2910,11 +3236,13 @@ class OneDriveConnector(BaseConnector):
             # Reinitialize credential to prevent session timeout issues
             await self._reinitialize_credential_if_needed()
             self._reset_permission_scopes()
+            self._health = RunHealth()
             await self._remind_about_certificate()
 
             # Sync all active users
             users = await self.msgraph_client.get_all_users()
             await self._process_users_in_batches(users)
+            await self._finish_run()
 
             self.logger.info("Incremental sync completed")
 
@@ -2988,10 +3316,12 @@ class OneDriveConnector(BaseConnector):
             for record in records:
                 try:
                     updated_record_data = await self._check_and_fetch_updated_record(org_id, record)
+                    content_changed = False
                     if updated_record_data:
-                        updated_record, permissions = updated_record_data
+                        updated_record, permissions, content_changed = updated_record_data
                         updated_records.append((updated_record, permissions))
-                    else:
+                    if not content_changed:
+                        # Saving an unchanged revision publishes nothing; a reindex must still re-queue it.
                         non_updated_records.append(record)
                 except Exception as e:
                     self.logger.error(f"Error checking record {record.id} at source: {e}")
@@ -3014,8 +3344,8 @@ class OneDriveConnector(BaseConnector):
 
     async def _check_and_fetch_updated_record(
         self, org_id: str, record: Record
-    ) -> Optional[Tuple[Record, List[Permission]]]:
-        """Fetch record from MS Graph and return data for reindexing if changed."""
+    ) -> Optional[Tuple[Record, List[Permission], bool]]:
+        """Fetch record from MS Graph and return it, its access and whether its content changed, if anything did."""
         try:
             drive_id = record.external_record_group_id
             item_id = record.external_record_id
@@ -3043,7 +3373,7 @@ class OneDriveConnector(BaseConnector):
                 self.logger.info(f"Record {item_id} has changed at source. Updating.")
                 # Ensure we keep the internal DB ID
                 record_update.record.id = record.id
-                return (record_update.record, record_update.new_permissions)
+                return (record_update.record, record_update.new_permissions, record_update.content_changed)
 
             return None
 
@@ -3282,6 +3612,7 @@ class OneDriveConnector(BaseConnector):
         scope_probes = [
             ("User.Read.All",  self._probe_users_scope),
             ("Group.Read.All", self._probe_groups_scope),
+            ("Files.Read.All", self._probe_files_scope),
         ]
 
         missing_scopes: List[str] = []
@@ -3326,12 +3657,12 @@ class OneDriveConnector(BaseConnector):
             await self.notify(
                 type=NotificationType.CONNECTOR_AUTH_ERROR,
                 severity=NotificationSeverity.ERROR,
-                title="OneDrive: missing API permissions",
+                title=self._notification_title("missing API permissions"),
                 message=message,
                 recipient_user_ids=[self.created_by],
                 payload={
                     "connector_id": self.connector_id,
-                    "connector_name": self.connector_name.value,
+                    "connector_name": self.display_name,
                     "connector_scope": self.scope,
                 },
             )
@@ -3348,6 +3679,28 @@ class OneDriveConnector(BaseConnector):
                 )
             )
         )
+
+    async def _probe_files_scope(self) -> None:
+        """Probe Files.Read.All: read the first OneDrive found among the first users. Without the permission
+        Graph answers 403 accessDenied; a 404 (no OneDrive) or 423 (locked) says nothing, so the next user is
+        tried. With no OneDrive among them the probe passes: the first sync checks each drive anyway."""
+        users = await self.client.users.get(
+            RequestConfiguration(
+                query_parameters=UsersRequestBuilder.UsersRequestBuilderGetQueryParameters(
+                    top=SHAREPOINT_CHECK_USERS, select=["id"]
+                )
+            )
+        )
+        for user in (users.value if users and users.value else [])[:SHAREPOINT_CHECK_USERS]:
+            if not user.id:
+                continue
+            try:
+                await self.client.users.by_user_id(user.id).drive.get()
+                return
+            except ODataError as e:
+                if e.response_status_code in (HTTPStatus.NOT_FOUND, 423):
+                    continue
+                raise
 
     async def _probe_groups_scope(self) -> None:
         """Probe Group.Read.All via GET /groups?$top=1&$select=id."""

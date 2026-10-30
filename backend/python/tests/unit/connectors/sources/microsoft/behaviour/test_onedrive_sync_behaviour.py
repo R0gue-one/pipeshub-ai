@@ -7,6 +7,7 @@ answered by an in-memory stub, and our databases are in-memory fakes.
 """
 
 import base64
+import json
 import logging
 import re
 import sys
@@ -59,6 +60,7 @@ from app.connectors.sources.microsoft.onedrive.connector import (
     certificate_problem,
     onedrive_config_action_items,
 )
+from app.connectors.sources.microsoft.onedrive.run_health import OneDriveSyncIncomplete
 from app.models.entities import FileRecord, RecordGroupType, RecordType
 from app.models.permission import EntityType, PermissionType
 
@@ -153,6 +155,8 @@ class Tenant:
         cloud.on("GET", "/v1.0/users", lambda _r: json_response(page(self.users)))
         cloud.on("GET", "/v1.0/groups", lambda _r: json_response(page(self.groups)))
         cloud.on("GET", GROUPS_DELTA_PATH, self.groups_delta)
+        # Listing the root site's app grants succeeds only with Sites.FullControl.All; granted unless a test says not.
+        cloud.on("GET", "/v1.0/sites/root/permissions", page([]))
 
     def add_user(self, user_id: str, email: str, name: str, user_type: str = "Member") -> TokenFeed:
         self.users.append({"id": user_id, "displayName": name, "mail": email, "userPrincipalName": email,
@@ -174,7 +178,9 @@ class Tenant:
 
     def add_group(self, group_id: str, name: str, members: object) -> None:
         self.groups.append({"id": group_id, "displayName": name, "description": f"{name} group"})
-        self.cloud.on("GET", f"/v1.0/groups/{group_id}/members", members if not isinstance(members, list) else page(members))
+        # Members at any depth: a nested group is listed along with the users inside it.
+        self.cloud.on("GET", f"/v1.0/groups/{group_id}/transitiveMembers", members if not isinstance(members, list) else page(members))
+        self.cloud.on("GET", f"/v1.0/groups/{group_id}", self.groups[-1])
 
 
 def member(user_id: str, email: str) -> dict[str, Any]:
@@ -315,6 +321,13 @@ def fail_next_checkpoint_move(connector: OneDriveConnector) -> None:
     store.update_sync_point = failing_once
 
 
+async def incomplete_run(connector: OneDriveConnector, *, incremental: bool = False) -> OneDriveSyncIncomplete:
+    """A run that could not read part of a OneDrive saves what it could, then fails."""
+    with pytest.raises(OneDriveSyncIncomplete) as raised:
+        await (connector.run_incremental_sync() if incremental else connector.run_sync())
+    return raised.value
+
+
 def perms(db: FakeRecordsDb, item_id: str) -> set[tuple]:
     return {(p.entity_type, p.external_id, p.email, p.type) for p in db.record_permissions[item_id]}
 
@@ -342,8 +355,9 @@ class TestRealClientsAndTokens:
 
         await connector.test_connection_and_access()
 
+        # Users, groups, and the user list of the Files.Read.All probe (the tenant has no users to read a OneDrive of).
         tokens = [bearer(r) for r in cloud.graph_calls()]
-        assert len(set(tokens)) == len(tokens) == 2, "each call found the cached token expired and got a new one"
+        assert len(set(tokens)) == len(tokens) == 3, "each call found the cached token expired and got a new one"
 
     async def test_a_rejected_secret_at_setup_is_reported_with_microsofts_reason(self, cloud, tenant, db, checkpoints) -> None:
         cloud.token_failure = json_response(
@@ -355,7 +369,7 @@ class TestRealClientsAndTokens:
             await connector.init()
 
         (note,) = await notes(connector)
-        assert note["title"] == "OneDrive authentication failed"
+        assert note["title"] == "OneDrive: Microsoft refused the sign-in"
         assert cloud.graph_calls() == []
 
     async def test_a_secret_that_expires_between_runs_stops_the_run_and_says_so(self, cloud, tenant, db, checkpoints) -> None:
@@ -368,7 +382,8 @@ class TestRealClientsAndTokens:
 
         assert cloud.graph_calls() == [], "nothing is read with a secret Microsoft rejected"
         (note,) = await notes(connector)
-        assert "client secret may have expired" in note["message"]
+        assert note["title"] == "OneDrive: Microsoft refused the sign-in"
+        assert "client secret or certificate may have expired" in note["message"]
 
     async def test_a_missing_directory_permission_is_named_in_the_error(self, cloud, tenant, db, checkpoints) -> None:
         cloud.on("GET", "/v1.0/groups", graph_error(403, "Authorization_RequestDenied", "Insufficient privileges"))
@@ -389,13 +404,14 @@ class TestDriveDeltaSync:
         feed.by_token["P2"] = page([drive_item("f2", "two.pdf")], delta_link=delta_link("u-ana", "D1"))
         for item_id in ("f1", "f2"):
             tenant.share(item_id, [user_grant("u-ana", "ana@acme.com", "owner")])
-            tenant.download_url(item_id)
         connector = await ready_connector(db, checkpoints)
 
         await connector.run_sync()
 
         assert sorted(db.records) == ["f1", "f2"]
-        assert db.records["f1"].signed_url == "https://download.example/f1"
+        # A download URL expires within the hour; it is fetched when the file is read, not stored.
+        assert db.records["f1"].signed_url is None
+        assert cloud.calls("GET", f"/v1.0/drives/{DRIVE}/items/f1") == []
         assert db.records["f1"].external_record_group_id == DRIVE
         assert drive_checkpoint(checkpoints) == {
             **drive_checkpoint(checkpoints), "nextLink": None, "deltaLink": delta_link("u-ana", "D1"),
@@ -462,8 +478,9 @@ class TestDriveDeltaSync:
         feed.by_token["P2"] = graph_error(503, "serviceNotAvailable")
         connector = await ready_connector(db, checkpoints)
 
-        await connector.run_sync()
+        await incomplete_run(connector)
 
+        assert connector.full_sync_coverage().complete is False
         assert sorted(db.records) == ["f1"]
         assert drive_checkpoint(checkpoints)["nextLink"] == delta_link("u-ana", "P2")
         assert drive_checkpoint(checkpoints).get("deltaLink") is None
@@ -558,7 +575,7 @@ class TestDriveDeltaSync:
         await connector.run_sync()
         db.unreadable_file_records.add(db.records["f1"].id)
 
-        await connector.run_sync()
+        await incomplete_run(connector)
 
         assert db.content_updates == []
         assert drive_checkpoint(checkpoints)["deltaLink"] == delta_link("u-ana", "D1")
@@ -579,7 +596,7 @@ class TestDriveDeltaSync:
         db.unreadable_file_records.add(db.records["f1"].id)
 
         for _ in range(4):
-            await connector.run_sync()
+            await incomplete_run(connector)
             assert drive_checkpoint(checkpoints)["deltaLink"] == delta_link("u-ana", "D1")
         await connector.run_sync()
 
@@ -587,13 +604,17 @@ class TestDriveDeltaSync:
         assert db.content_updates == []
         assert db.records["f1"].external_revision_id != "v2"
 
-    async def test_one_malformed_item_does_not_stop_the_rest_of_the_page(self, cloud, tenant, db, checkpoints) -> None:
+    async def test_one_malformed_item_holds_its_page_until_it_is_given_up_on_then_the_rest_is_saved(self, cloud, tenant, db, checkpoints) -> None:
         broken = drive_item("f-bad", "bad.pdf")
         del broken["createdDateTime"]
         feed = tenant.add_user("u-ana", "ana@acme.com", "Ana")
         feed.by_token[None] = page([drive_item("f1", "one.pdf"), broken, drive_item("f2", "two.pdf")], delta_link=delta_link("u-ana", "D1"))
         connector = await ready_connector(db, checkpoints)
 
+        for attempt in range(1, MAX_PAGE_ATTEMPTS):
+            await incomplete_run(connector)
+            assert drive_checkpoint(checkpoints)["heldPageAttempts"] == attempt
+            assert drive_checkpoint(checkpoints).get("deltaLink") is None
         await connector.run_sync()
 
         assert sorted(db.records) == ["f1", "f2"]
@@ -606,11 +627,16 @@ class TestDriveDeltaSync:
         ben.by_token[None] = page([drive_item("f-ben", "ben.pdf", drive="drive-ben")], delta_link=delta_link("u-ben", "D1"))
         connector = await ready_connector(db, checkpoints)
 
-        await connector.run_sync()
+        failure = await incomplete_run(connector)
 
         assert sorted(db.records) == ["f-ben"]
-        assert drive_checkpoint(checkpoints, "u-ana") is None
+        assert drive_checkpoint(checkpoints, "u-ana").get("deltaLink") is None
+        assert drive_checkpoint(checkpoints, "u-ana").get("nextLink") is None
         assert drive_checkpoint(checkpoints, "u-ben")["deltaLink"] == delta_link("u-ben", "D1")
+        assert "ana@acme.com" in str(failure)
+        (note,) = [n for n in await notes(connector) if n["title"] == "OneDrive: some OneDrives could not be synced"]
+        assert "ana@acme.com" in note["message"] and "ben@acme.com" not in note["message"]
+        assert connector.full_sync_coverage().complete is False
 
     async def test_users_without_onedrive_are_skipped_and_named_in_a_warning(self, cloud, tenant, db, checkpoints) -> None:
         tenant.add_user("u-ana", "ana@acme.com", "Ana").by_token[None] = page([], delta_link=delta_link("u-ana", "D1"))
@@ -621,7 +647,7 @@ class TestDriveDeltaSync:
         await connector.run_sync()
 
         sent = await notes(connector)
-        warning = next(n for n in sent if n["title"] == "OneDrive not provisioned for some users")
+        warning = next(n for n in sent if n["title"] == "OneDrive: OneDrive not provisioned for some users")
         assert "cal@acme.com" in warning["message"] and "ana@acme.com" not in warning["message"]
         assert cloud.calls("GET", "/v1.0/users/u-cal/drive/root/delta") == []
 
@@ -736,7 +762,7 @@ class TestSharing:
         tenant.share("f1", graph_error(503, "serviceNotAvailable"))
 
         for _ in range(4):
-            await connector.run_sync()
+            await incomplete_run(connector)
             assert "f1" not in db.records
             assert drive_checkpoint(checkpoints)["deltaLink"] == delta_link("u-ana", "D1")
         await connector.run_sync()
@@ -760,7 +786,7 @@ class TestSharing:
         tenant.share("f1", graph_error(403, "accessDenied"))
         fail_next_checkpoint_move(connector)
 
-        await connector.run_sync()
+        await incomplete_run(connector)
 
         assert "f1" in db.records
         assert drive_checkpoint(checkpoints)["deltaLink"] == delta_link("u-ana", "D1")
@@ -793,6 +819,46 @@ class TestSharing:
 
         assert (EntityType.USER, "u-ben", "ben@acme.com", PermissionType.READ) in perms(db, "f1")
 
+    async def test_removing_one_person_from_a_folder_that_stays_shared_removes_them_from_its_files(self, cloud, tenant, db, checkpoints) -> None:
+        # Graph lists only the folder, still `shared` (live probe, 2026-10-29): its access is what changed.
+        feed = tenant.add_user("u-ana", "ana@acme.com", "Ana")
+        feed.by_token[None] = page(
+            [drive_item("d1", "Plans", folder=True, shared=True), drive_item("f1", "plan.pdf", parent="d1", shared=True)],
+            delta_link=delta_link("u-ana", "D1"),
+        )
+        feed.by_token["D1"] = page([drive_item("d1", "Plans", folder=True, shared=True, etag="v2")], delta_link=delta_link("u-ana", "D2"))
+        both = [user_grant("u-ana", "ana@acme.com", "owner"), user_grant("u-ben", "ben@acme.com"), user_grant("u-cal", "cal@acme.com")]
+        tenant.share("d1", both)
+        tenant.share("f1", both)
+        connector = await ready_connector(db, checkpoints)
+        await connector.run_sync()
+        cloud.on("GET", f"/v1.0/drives/{DRIVE}/items/d1/children", page([drive_item("f1", "plan.pdf", parent="d1", shared=True)]))
+        tenant.share("d1", [both[0], both[2]])
+        tenant.share("f1", [both[0], both[2]])
+
+        await connector.run_sync()
+
+        assert (EntityType.USER, "u-ben", "ben@acme.com", PermissionType.READ) not in perms(db, "f1")
+        assert (EntityType.USER, "u-cal", "cal@acme.com", PermissionType.READ) in perms(db, "f1")
+
+    async def test_a_folder_listed_with_unchanged_access_does_not_reread_its_files(self, cloud, tenant, db, checkpoints) -> None:
+        feed = tenant.add_user("u-ana", "ana@acme.com", "Ana")
+        feed.by_token[None] = page(
+            [drive_item("d1", "Plans", folder=True, shared=True), drive_item("f1", "plan.pdf", parent="d1", shared=True)],
+            delta_link=delta_link("u-ana", "D1"),
+        )
+        # A file added inside lists the folder again; its sharing is as it was.
+        feed.by_token["D1"] = page([drive_item("d1", "Plans", folder=True, shared=True, etag="v2")], delta_link=delta_link("u-ana", "D2"))
+        grants = [user_grant("u-ana", "ana@acme.com", "owner"), user_grant("u-ben", "ben@acme.com")]
+        tenant.share("d1", grants)
+        tenant.share("f1", grants)
+        connector = await ready_connector(db, checkpoints)
+        await connector.run_sync()
+
+        await connector.run_sync()
+
+        assert cloud.calls("GET", f"/v1.0/drives/{DRIVE}/items/d1/children") == []
+
     async def test_a_failed_sharing_read_for_a_file_inside_a_shared_folder_keeps_its_access(self, cloud, tenant, db, checkpoints) -> None:
         feed = tenant.add_user("u-ana", "ana@acme.com", "Ana")
         feed.by_token[None] = page(
@@ -805,7 +871,7 @@ class TestSharing:
         cloud.on("GET", f"/v1.0/drives/{DRIVE}/items/d1/children", page([drive_item("f1", "plan.pdf", parent="d1")]))
         tenant.share("f1", graph_error(503, "serviceNotAvailable"))
 
-        await connector.run_sync()
+        await incomplete_run(connector)
 
         assert perms(db, "f1") == {(EntityType.USER, "u-ben", "ben@acme.com", PermissionType.READ)}
 
@@ -821,7 +887,7 @@ class TestSharing:
         await connector.run_sync()
         cloud.on("GET", f"/v1.0/drives/{DRIVE}/items/d1/children", page([drive_item("f1", "plan.pdf", parent="d1")]))
         tenant.share("f1", graph_error(503, "serviceNotAvailable"))
-        await connector.run_sync()
+        await incomplete_run(connector)
         assert drive_checkpoint(checkpoints)["deltaLink"] == delta_link("u-ana", "D1"), "the page is replayed next run"
         assert db.records["d1"].is_shared is False
 
@@ -836,7 +902,7 @@ class TestSharing:
     async def test_a_failed_listing_of_a_shared_folders_files_is_tried_again_next_run(self, cloud, tenant, db, checkpoints) -> None:
         connector = await shared_folder_scenario(cloud, tenant, db, checkpoints)
         cloud.on("GET", f"/v1.0/drives/{DRIVE}/items/d1/children", graph_error(503, "serviceNotAvailable"))
-        await connector.run_sync()
+        await incomplete_run(connector)
         assert drive_checkpoint(checkpoints)["deltaLink"] == delta_link("u-ana", "D1")
         assert db.records["d1"].is_shared is False
 
@@ -864,7 +930,7 @@ class TestSharing:
         tenant.share("f1", graph_error(503, "serviceNotAvailable"))
 
         for _ in range(4):
-            await connector.run_sync()
+            await incomplete_run(connector)
             assert drive_checkpoint(checkpoints)["deltaLink"] == delta_link("u-ana", "D1")
         await connector.run_sync()
 
@@ -888,7 +954,7 @@ class TestSharing:
         tenant.share("f1", graph_error(503, "serviceNotAvailable"))
 
         for _ in range(4):
-            await connector.run_sync()
+            await incomplete_run(connector)
             assert perms(db, "f1") == {
                 (EntityType.USER, "u-ana", "ana@acme.com", PermissionType.OWNER),
                 (EntityType.USER, "u-ben", "ben@acme.com", PermissionType.READ),
@@ -913,7 +979,7 @@ class TestSharing:
         connector = await unlistable_unshared_folder_scenario(cloud, tenant, db, checkpoints)
         tenant.share("d1", graph_error(503, "serviceNotAvailable"))
 
-        await connector.run_sync()
+        await incomplete_run(connector)
 
         # A failed folder read must not replace the file's stored grants.
         assert perms(db, "f2") == {
@@ -959,7 +1025,7 @@ class TestSharing:
             tenant.share(item_id, graph_error(403, "accessDenied"))
         fail_next_checkpoint_move(connector)
 
-        await connector.run_sync()
+        await incomplete_run(connector)
 
         assert db.records["d1"].is_shared is False
         assert drive_checkpoint(checkpoints)["deltaLink"] == delta_link("u-ana", "D1")
@@ -980,20 +1046,28 @@ class TestSharing:
 
 class TestGroups:
     async def test_first_sync_saves_every_group_with_all_member_pages_and_nested_members(self, cloud, tenant, db, checkpoints) -> None:
-        tenant.add_group("g-eng", "Eng", {
+        first = {
             "value": [member("u-ana", "ana@acme.com"), nested("g-sre")],
-            "@odata.nextLink": f"{GRAPH}/groups/g-eng/members?$skiptoken=2",
-        })
-        first = cloud._routes[0][2]
-        cloud.on("GET", "/v1.0/groups/g-eng/members",
-                 lambda r: json_response(page([member("u-ben", "ben@acme.com")]) if "$skiptoken" in MicrosoftCloudStub.query(r) else first))
-        cloud.on("GET", "/v1.0/groups/g-sre/members", page([member("u-cal", "cal@acme.com"), {"@odata.type": "#microsoft.graph.device", "id": "dev-1"}]))
+            "@odata.nextLink": f"{GRAPH}/groups/g-eng/transitiveMembers?$skiptoken=2",
+        }
+        # Transitive members list the nested group and, at any depth, the users inside it.
+        second = page([member("u-cal", "cal@acme.com"), {"@odata.type": "#microsoft.graph.device", "id": "dev-1"},
+                       member("u-ben", "ben@acme.com")])
+        tenant.add_group("g-eng", "Eng", first)
+        cloud.on("GET", "/v1.0/groups/g-eng/transitiveMembers",
+                 lambda r: json_response(second if "$skiptoken" in MicrosoftCloudStub.query(r) else first))
         connector = await ready_connector(db, checkpoints)
 
         await connector._sync_user_groups()
 
         assert db.user_groups == {"g-eng": ["ana@acme.com", "cal@acme.com", "ben@acme.com"]}
-        assert groups_checkpoint(checkpoints)["deltaLink"] == groups_link("G1")
+        stored = groups_checkpoint(checkpoints)
+        assert stored["deltaLink"] == groups_link("G1")
+        assert stored["membersTransitive"] is True
+        assert json.loads(stored["nestedIn"]) == {"g-sre": ["g-eng"]}
+        assert len(cloud.calls("GET", "/v1.0/groups")) == 1, "one full read, which also sets the marker"
+        assert cloud.calls("GET", "/v1.0/groups/g-sre/transitiveMembers") == []
+        assert cloud.calls("GET", "/v1.0/groups/g-eng/members") == []
 
     async def test_group_changes_are_applied_from_the_delta_link(self, cloud, tenant, db, checkpoints) -> None:
         tenant.add_group("g-eng", "Eng", [member("u-ana", "ana@acme.com")])
@@ -1004,7 +1078,7 @@ class TestGroups:
         ], delta_link=groups_link("G2"))
         connector = await ready_connector(db, checkpoints)
         await connector._sync_user_groups()
-        cloud.on("GET", "/v1.0/groups/g-eng/members", page([member("u-ana", "ana@acme.com"), member("u-ben", "ben@acme.com")]))
+        cloud.on("GET", "/v1.0/groups/g-eng/transitiveMembers", page([member("u-ana", "ana@acme.com"), member("u-ben", "ben@acme.com")]))
         cloud.on("GET", "/v1.0/users/u-ben", {"id": "u-ben", "mail": "ben@acme.com"})
 
         await connector._sync_user_groups()
@@ -1021,7 +1095,7 @@ class TestGroups:
         )
         connector = await ready_connector(db, checkpoints)
         await connector._sync_user_groups()
-        cloud.on("GET", "/v1.0/groups/g-eng/members", page([member("u-ana", "ana@acme.com")]))
+        cloud.on("GET", "/v1.0/groups/g-eng/transitiveMembers", page([member("u-ana", "ana@acme.com")]))
         cloud.on("GET", "/v1.0/users/u-ben", {"id": "u-ben", "mail": "ben@acme.com"})
 
         await connector._sync_user_groups()
@@ -1039,7 +1113,7 @@ class TestGroups:
         cloud.on("GET", "/v1.0/users/u-ben", {"id": "u-ben", "mail": "ben@acme.com"})
         connector = await ready_connector(db, checkpoints)
         await connector._sync_user_groups()
-        cloud.on("GET", "/v1.0/groups/g-eng/members", graph_error(403, "Authorization_RequestDenied", "hidden membership"))
+        cloud.on("GET", "/v1.0/groups/g-eng/transitiveMembers", graph_error(403, "Authorization_RequestDenied", "hidden membership"))
         db.fail_member_removal.add(("g-eng", "ben@acme.com"))
 
         await connector._sync_user_groups()
@@ -1063,7 +1137,7 @@ class TestGroups:
         cloud.on("GET", "/v1.0/users/u-ben", {"id": "u-ben", "mail": "ben@acme.com"})
         connector = await ready_connector(db, checkpoints)
         await connector._sync_user_groups()
-        cloud.on("GET", "/v1.0/groups/g-eng/members", graph_error(403, "Authorization_RequestDenied", "hidden membership"))
+        cloud.on("GET", "/v1.0/groups/g-eng/transitiveMembers", graph_error(403, "Authorization_RequestDenied", "hidden membership"))
         db.fail_member_removal.add(("g-eng", "ben@acme.com"))
 
         await connector._sync_user_groups()
@@ -1089,7 +1163,7 @@ class TestGroups:
         cloud.on("GET", "/v1.0/users/u-ben", {"id": "u-ben", "mail": "ben@acme.com"})
         connector = await ready_connector(db, checkpoints)
         await connector._sync_user_groups()
-        cloud.on("GET", "/v1.0/groups/g-eng/members", graph_error(403, "Authorization_RequestDenied", "hidden membership"))
+        cloud.on("GET", "/v1.0/groups/g-eng/transitiveMembers", graph_error(403, "Authorization_RequestDenied", "hidden membership"))
         db.fail_member_removal.add(("g-eng", "ben@acme.com"))
 
         for _ in range(4):
@@ -1102,7 +1176,7 @@ class TestGroups:
         assert db.user_groups == {"g-eng": ["ana@acme.com", "ben@acme.com"]}
 
         # The full sync that is owed reads the members again, which takes Ben out.
-        cloud.on("GET", "/v1.0/groups/g-eng/members", page([member("u-ana", "ana@acme.com")]))
+        cloud.on("GET", "/v1.0/groups/g-eng/transitiveMembers", page([member("u-ana", "ana@acme.com")]))
         await connector._sync_user_groups()
 
         assert db.user_groups == {"g-eng": ["ana@acme.com"]}
@@ -1113,7 +1187,7 @@ class TestGroups:
         tenant.groups_delta.by_token["G1"] = page([{"id": "g-eng", "displayName": "Eng renamed"}], delta_link=groups_link("G2"))
         connector = await ready_connector(db, checkpoints)
         await connector._sync_user_groups()
-        cloud.on("GET", "/v1.0/groups/g-eng/members", graph_error(503, "serviceNotAvailable"))
+        cloud.on("GET", "/v1.0/groups/g-eng/transitiveMembers", graph_error(503, "serviceNotAvailable"))
 
         await connector._sync_user_groups()
 
@@ -1129,14 +1203,14 @@ class TestGroups:
         cloud.on("GET", "/v1.0/users/u-ben", {"id": "u-ben", "mail": "ben@acme.com"})
         connector = await ready_connector(db, checkpoints)
         await connector._sync_user_groups()
-        cloud.on("GET", "/v1.0/groups/g-eng/members", graph_error(503, "serviceNotAvailable"))
+        cloud.on("GET", "/v1.0/groups/g-eng/transitiveMembers", graph_error(503, "serviceNotAvailable"))
 
         await connector._sync_user_groups()
 
         assert db.user_groups == {"g-eng": ["ana@acme.com"]}, "the removal needs no member read; the rest stays as stored"
         assert groups_checkpoint(checkpoints)["deltaLink"] == groups_link("G1")
 
-        cloud.on("GET", "/v1.0/groups/g-eng/members", page([member("u-ana", "ana@acme.com")]))
+        cloud.on("GET", "/v1.0/groups/g-eng/transitiveMembers", page([member("u-ana", "ana@acme.com")]))
         await connector._sync_user_groups()
 
         assert db.user_groups == {"g-eng": ["ana@acme.com"]}
@@ -1151,7 +1225,7 @@ class TestGroups:
         )
         connector = await ready_connector(db, checkpoints)
         await connector._sync_user_groups()
-        cloud.on("GET", "/v1.0/groups/g-eng/members", graph_error(403, "Authorization_RequestDenied", "hidden membership"))
+        cloud.on("GET", "/v1.0/groups/g-eng/transitiveMembers", graph_error(403, "Authorization_RequestDenied", "hidden membership"))
 
         await connector._sync_user_groups()
 
@@ -1164,7 +1238,7 @@ class TestGroups:
         tenant.groups_delta.by_token["G1"] = page([{"id": "g-eng", "displayName": "Eng"}], delta_link=groups_link("G2"))
         connector = await ready_connector(db, checkpoints)
         await connector._sync_user_groups()
-        cloud.on("GET", "/v1.0/groups/g-eng/members", graph_error(503, "serviceNotAvailable"))
+        cloud.on("GET", "/v1.0/groups/g-eng/transitiveMembers", graph_error(503, "serviceNotAvailable"))
 
         for _ in range(4):
             await connector._sync_user_groups()
@@ -1183,7 +1257,7 @@ class TestGroups:
         cloud.on("GET", "/v1.0/users/u-ben", {"id": "u-ben", "mail": "ben@acme.com"})
         connector = await ready_connector(db, checkpoints)
         await connector._sync_user_groups()
-        cloud.on("GET", "/v1.0/groups/g-eng/members", graph_error(503, "serviceNotAvailable"))
+        cloud.on("GET", "/v1.0/groups/g-eng/transitiveMembers", graph_error(503, "serviceNotAvailable"))
 
         for _ in range(5):
             await connector._sync_user_groups()
@@ -1221,13 +1295,13 @@ class TestGroups:
         tenant.groups_delta.by_token["G2"] = page([], delta_link=groups_link("G3"))
         connector = await ready_connector(db, checkpoints)
         await connector._sync_user_groups()
-        cloud.on("GET", "/v1.0/groups/g-eng/members", graph_error(503, "serviceNotAvailable"))
+        cloud.on("GET", "/v1.0/groups/g-eng/transitiveMembers", graph_error(503, "serviceNotAvailable"))
         for _ in range(5):
             await connector._sync_user_groups()
         assert groups_checkpoint(checkpoints)["deltaLink"] == groups_link("G2")
         assert db.user_groups == {"g-eng": ["ana@acme.com"]}
 
-        cloud.on("GET", "/v1.0/groups/g-eng/members", page([member("u-ana", "ana@acme.com"), member("u-ben", "ben@acme.com")]))
+        cloud.on("GET", "/v1.0/groups/g-eng/transitiveMembers", page([member("u-ana", "ana@acme.com"), member("u-ben", "ben@acme.com")]))
         await connector._sync_user_groups()
 
         assert db.user_groups == {"g-eng": ["ana@acme.com", "ben@acme.com"]}
@@ -1239,13 +1313,13 @@ class TestGroups:
         # g-new is only in the delta, so the full sync never reads it.
         tenant.groups_delta.by_token["G1"] = page([{"id": "g-new", "displayName": "New"}], delta_link=groups_link("G2"))
         tenant.groups_delta.by_token["G2"] = page([], delta_link=groups_link("G3"))
-        cloud.on("GET", "/v1.0/groups/g-new/members", graph_error(503, "serviceNotAvailable"))
+        cloud.on("GET", "/v1.0/groups/g-new/transitiveMembers", graph_error(503, "serviceNotAvailable"))
         connector = await ready_connector(db, checkpoints)
         await connector._sync_user_groups()
         assert groups_checkpoint(checkpoints)["fullSyncIncomplete"] is True
         # Four earlier runs already held the G1 page, so this run gives up on g-new.
         groups_checkpoint(checkpoints).update({"heldPage": groups_link("G1"), "heldPageAttempts": 4})
-        cloud.on("GET", "/v1.0/groups/g-ops/members", page([member("u-cal", "cal@acme.com")]))
+        cloud.on("GET", "/v1.0/groups/g-ops/transitiveMembers", page([member("u-cal", "cal@acme.com")]))
 
         await connector._sync_user_groups()
 
@@ -1271,23 +1345,107 @@ class TestGroups:
         tenant.add_group("g-ops", "Ops", graph_error(503, "serviceNotAvailable"))
         connector = await ready_connector(db, checkpoints)
 
-        for _ in range(6):
+        for _ in range(MAX_PAGE_ATTEMPTS):
+            await connector._sync_user_groups()
+        given_up = len(cloud.calls("GET", "/v1.0/groups"))
+        for _ in range(2):
             await connector._sync_user_groups()
 
-        assert len(cloud.calls("GET", "/v1.0/groups")) == 5
+        assert len(cloud.calls("GET", "/v1.0/groups")) == given_up, "no full group read after the attempts are used up"
         assert db.user_groups == {"g-eng": ["ana@acme.com"]}
 
-    async def test_a_failed_nested_group_read_keeps_the_parent_groups_stored_members(self, cloud, tenant, db, checkpoints) -> None:
-        tenant.add_group("g-eng", "Eng", [member("u-ana", "ana@acme.com"), nested("g-sre")])
-        cloud.on("GET", "/v1.0/groups/g-sre/members", page([member("u-cal", "cal@acme.com")]))
-        tenant.groups_delta.by_token["G1"] = page([{"id": "g-eng", "displayName": "Eng"}], delta_link=groups_link("G2"))
+    async def _nested_groups(self, cloud, tenant, db, checkpoints) -> OneDriveConnector:
+        """g-eng contains g-sre; both are stored after a first sync."""
+        tenant.add_group("g-eng", "Eng", [member("u-ana", "ana@acme.com"), nested("g-sre"), member("u-cal", "cal@acme.com")])
+        tenant.add_group("g-sre", "SRE", [member("u-cal", "cal@acme.com")])
         connector = await ready_connector(db, checkpoints)
         await connector._sync_user_groups()
-        cloud.on("GET", "/v1.0/groups/g-sre/members", graph_error(403, "accessDenied"))
+        assert db.user_groups == {"g-eng": ["ana@acme.com", "cal@acme.com"], "g-sre": ["cal@acme.com"]}
+        return connector
+
+    async def test_a_change_inside_a_nested_group_reads_the_groups_around_it_again(self, cloud, tenant, db, checkpoints) -> None:
+        connector = await self._nested_groups(cloud, tenant, db, checkpoints)
+        # Graph reports the change on g-sre only: members@delta lists direct members.
+        tenant.groups_delta.by_token["G1"] = page(
+            [{"id": "g-sre", "displayName": "SRE", "members@delta": [{"id": "u-dan"}]}], delta_link=groups_link("G2")
+        )
+        cloud.on("GET", "/v1.0/groups/g-sre/transitiveMembers", page([member("u-cal", "cal@acme.com"), member("u-dan", "dan@acme.com")]))
+        cloud.on("GET", "/v1.0/groups/g-eng/transitiveMembers", page(
+            [member("u-ana", "ana@acme.com"), nested("g-sre"), member("u-cal", "cal@acme.com"), member("u-dan", "dan@acme.com")]
+        ))
 
         await connector._sync_user_groups()
 
-        assert db.user_groups == {"g-eng": ["ana@acme.com", "cal@acme.com"]}
+        assert db.user_groups["g-sre"] == ["cal@acme.com", "dan@acme.com"]
+        assert db.user_groups["g-eng"] == ["ana@acme.com", "cal@acme.com", "dan@acme.com"]
+        assert groups_checkpoint(checkpoints)["deltaLink"] == groups_link("G2")
+
+    async def test_an_outer_group_that_cannot_be_read_again_holds_the_group_delta(self, cloud, tenant, db, checkpoints) -> None:
+        connector = await self._nested_groups(cloud, tenant, db, checkpoints)
+        tenant.groups_delta.by_token["G1"] = page(
+            [{"id": "g-sre", "displayName": "SRE", "members@delta": [{"id": "u-dan"}]}], delta_link=groups_link("G2")
+        )
+        cloud.on("GET", "/v1.0/groups/g-sre/transitiveMembers", page([member("u-cal", "cal@acme.com"), member("u-dan", "dan@acme.com")]))
+        cloud.on("GET", "/v1.0/groups/g-eng", graph_error(503, "serviceNotAvailable"))
+
+        await connector._sync_user_groups()
+
+        assert db.user_groups["g-eng"] == ["ana@acme.com", "cal@acme.com"], "kept as stored"
+        assert groups_checkpoint(checkpoints)["deltaLink"] == groups_link("G1")
+        assert groups_checkpoint(checkpoints)["heldPageAttempts"] == 1
+
+    async def test_a_deleted_nested_group_reads_the_groups_around_it_again_and_is_forgotten(self, cloud, tenant, db, checkpoints) -> None:
+        connector = await self._nested_groups(cloud, tenant, db, checkpoints)
+        tenant.groups_delta.by_token["G1"] = page([{"id": "g-sre", "@removed": {"reason": "deleted"}}], delta_link=groups_link("G2"))
+        cloud.on("GET", "/v1.0/groups/g-eng/transitiveMembers", page([member("u-ana", "ana@acme.com")]))
+
+        await connector._sync_user_groups()
+
+        assert db.user_groups == {"g-eng": ["ana@acme.com"]}
+        assert db.deleted_groups == ["g-sre"]
+        assert json.loads(groups_checkpoint(checkpoints)["nestedIn"]) == {}
+
+    @pytest.mark.parametrize("expired", [
+        graph_error(410, "resyncRequired"),
+        graph_error(400, "syncStateNotFound"),
+        graph_error(400, "Request_DeltaTokenExpired"),
+    ])
+    async def test_an_expired_group_delta_token_reads_every_group_again(self, cloud, tenant, db, checkpoints, expired) -> None:
+        tenant.add_group("g-eng", "Eng", [member("u-ana", "ana@acme.com")])
+        connector = await ready_connector(db, checkpoints)
+        await connector._sync_user_groups()
+        tenant.groups_delta.by_token["G1"] = expired
+        tenant.groups_delta.by_token[None] = page([], delta_link=groups_link("G5"))
+        cloud.on("GET", "/v1.0/groups/g-eng/transitiveMembers", page([member("u-ana", "ana@acme.com"), member("u-ben", "ben@acme.com")]))
+
+        await connector._sync_user_groups()
+
+        assert db.user_groups == {"g-eng": ["ana@acme.com", "ben@acme.com"]}
+        assert len(cloud.calls("GET", "/v1.0/groups")) == 2
+        assert groups_checkpoint(checkpoints)["deltaLink"] == groups_link("G5")
+
+    async def test_another_bad_request_on_the_group_delta_is_raised(self, cloud, tenant, db, checkpoints) -> None:
+        tenant.add_group("g-eng", "Eng", [member("u-ana", "ana@acme.com")])
+        connector = await ready_connector(db, checkpoints)
+        await connector._sync_user_groups()
+        tenant.groups_delta.by_token["G1"] = graph_error(400, "invalidRequest")
+
+        with pytest.raises(ODataError):
+            await connector._sync_user_groups()
+
+        assert groups_checkpoint(checkpoints)["deltaLink"] == groups_link("G1")
+
+    async def test_groups_stored_before_members_were_read_at_any_depth_are_read_again_once(self, cloud, tenant, db, checkpoints) -> None:
+        tenant.add_group("g-eng", "Eng", [member("u-ana", "ana@acme.com")])
+        connector = await ready_connector(db, checkpoints)
+        await connector._sync_user_groups()
+        groups_checkpoint(checkpoints).pop("membersTransitive")
+
+        await connector._sync_user_groups()
+        await connector._sync_user_groups()
+
+        assert len(cloud.calls("GET", "/v1.0/groups")) == 2
+        assert groups_checkpoint(checkpoints)["membersTransitive"] is True
 
     async def test_a_group_whose_members_cannot_be_read_at_first_sync_is_not_saved_empty(self, cloud, tenant, db, checkpoints) -> None:
         tenant.add_group("g-eng", "Eng", [member("u-ana", "ana@acme.com")])
@@ -1303,7 +1461,7 @@ class TestGroups:
         tenant.add_group("g-ops", "Ops", graph_error(503, "serviceNotAvailable"))
         connector = await ready_connector(db, checkpoints)
         await connector._sync_user_groups()
-        cloud.on("GET", "/v1.0/groups/g-ops/members", page([member("u-ben", "ben@acme.com")]))
+        cloud.on("GET", "/v1.0/groups/g-ops/transitiveMembers", page([member("u-ben", "ben@acme.com")]))
 
         await connector._sync_user_groups()
 
@@ -1324,7 +1482,7 @@ class TestGroups:
         assert db.deleted_groups == ["g-a"]
         assert db.user_groups == {}
 
-        cloud.on("GET", "/v1.0/groups/g-b/members", page([member("u-ben", "ben@acme.com")]))
+        cloud.on("GET", "/v1.0/groups/g-b/transitiveMembers", page([member("u-ben", "ben@acme.com")]))
         tenant.groups_delta.by_token["G2"] = page([], delta_link=groups_link("G3"))
         await connector._sync_user_groups()
 
@@ -1366,7 +1524,7 @@ class TestGroups:
 
 
 class TestReindexAndDownload:
-    async def test_reindex_refreshes_changed_files_and_requeues_unchanged_ones(self, cloud, tenant, db, checkpoints) -> None:
+    async def test_reindex_refreshes_changed_files_and_requeues_every_file_whose_content_did_not_change(self, cloud, tenant, db, checkpoints) -> None:
         feed = tenant.add_user("u-ana", "ana@acme.com", "Ana")
         feed.by_token[None] = page([drive_item("f1", "one.pdf"), drive_item("f2", "two.pdf")], delta_link=delta_link("u-ana", "D1"))
         connector = await ready_connector(db, checkpoints)
@@ -1379,6 +1537,20 @@ class TestReindexAndDownload:
 
         assert db.records["f1"].record_name == "one-renamed.pdf"
         assert db.records["f1"].id == stored[0].id
+        # A rename alone publishes no content event when saved, so f1 is re-queued as well.
+        assert [r.external_record_id for r in db.reindexed] == ["f1", "f2"]
+
+    async def test_reindex_does_not_requeue_a_file_whose_content_changed(self, cloud, tenant, db, checkpoints) -> None:
+        feed = tenant.add_user("u-ana", "ana@acme.com", "Ana")
+        feed.by_token[None] = page([drive_item("f1", "one.pdf"), drive_item("f2", "two.pdf")], delta_link=delta_link("u-ana", "D1"))
+        connector = await ready_connector(db, checkpoints)
+        await connector.run_sync()
+        cloud.on("GET", f"/v1.0/drives/{DRIVE}/items/f1", drive_item("f1", "one.pdf", etag="v2", quick_xor="hash-2"))
+        cloud.on("GET", f"/v1.0/drives/{DRIVE}/items/f2", drive_item("f2", "two.pdf"))
+
+        await connector.reindex_records([db.records["f1"], db.records["f2"]])
+
+        assert db.records["f1"].quick_xor_hash == "hash-2"
         assert [r.external_record_id for r in db.reindexed] == ["f2"]
 
     async def test_opening_a_file_uses_a_fresh_download_link(self, cloud, tenant, db, checkpoints) -> None:
@@ -1779,7 +1951,7 @@ def notification_titles(sent: list[dict[str, Any]]) -> list[str]:
     return [n.get("title") for n in sent]
 
 
-INHERITANCE_WARNING = "OneDrive can't read inherited permissions"
+INHERITANCE_WARNING = "OneDrive: can't read inherited permissions"
 
 
 class TestCertificateSignIn:
@@ -2158,7 +2330,7 @@ class TestMigration:
     """A drive stored before the certificate is rewritten onto inheritance once, without losing changes."""
 
     async def secret_only_then_certificate(self, cloud, tenant, db, checkpoints) -> tuple[TokenFeed, OneDriveConnector]:
-        """Links D* are made without the sharing-changes preference, S* with it (the rewrite's)."""
+        """Links D* are the drive's, S* the rewrite's; neither asks for sharing changes."""
         feed = inheritance_drive(tenant)
         first = feed.by_token[None]
         feed.by_token[None] = [first, page(first["value"], delta_link=delta_link("u-ana", "S1"))]
@@ -2169,6 +2341,8 @@ class TestMigration:
         serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
         await (await ready_connector(db, checkpoints)).run_sync()
         assert db.inherit_edges["f1"] is False and perms(db, "f1")
+        # As a version that asked for sharing changes only with a certificate left the drive.
+        drive_checkpoint(checkpoints).pop("sharingChanges")
         return feed, await certificate_connector(db, checkpoints)
 
     async def test_without_a_certificate_no_permission_state_is_kept(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
@@ -2190,11 +2364,11 @@ class TestMigration:
         assert (EntityType.USER, "u-cal", "cal@acme.com", PermissionType.READ) in perms(db, "f2")
         assert db.inherit_edges["d1"] is False and db.inherit_edges["root-ana"] is False
         assert permission_state(checkpoints)["mode"] == "inheritance"
-        assert feed.seen == [None, "D1", None, "D2"], (
-            "the normal delta, one full enumeration, then the old link once more so nothing deleted meanwhile is missed"
+        assert feed.seen == [None, "D1", None], (
+            "the normal delta, then one full enumeration; the drive's link is of the rewrite's kind, so it stays"
         )
-        assert drive_checkpoint(checkpoints)["deltaLink"] == delta_link("u-ana", "S1")
-        assert drive_checkpoint(checkpoints)["sharingChanges"] is True
+        assert drive_checkpoint(checkpoints)["deltaLink"] == delta_link("u-ana", "D2")
+        assert not drive_checkpoint(checkpoints).get("sharingChanges")
         assert len(db.content_updates) == content_updates, "a rewrite of access re-indexes nothing"
 
     async def test_the_rewrite_happens_once(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
@@ -2204,7 +2378,7 @@ class TestMigration:
 
         await connector.run_sync()
 
-        assert feed.seen == [None, "D1", None, "D2", "S1"]
+        assert feed.seen == [None, "D1", None, "D2"]
         assert len(db.permission_updates) == writes
 
     async def test_a_first_sync_with_the_certificate_needs_no_rewrite(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
@@ -2228,8 +2402,8 @@ class TestMigration:
         assert permission_state(checkpoints).get("mode") is None
         await connector.run_sync()
 
-        assert feed.seen == [None, "D1", None, "M2", "D2", "M2", "D3"], "resumed from its own cursor, not started over"
-        assert drive_checkpoint(checkpoints)["deltaLink"] == delta_link("u-ana", "S1")
+        assert feed.seen == [None, "D1", None, "M2", "D2", "M2"], "resumed from its own cursor, not started over"
+        assert drive_checkpoint(checkpoints)["deltaLink"] == delta_link("u-ana", "D3")
         assert permission_state(checkpoints)["mode"] == "inheritance"
         assert db.inherit_edges["f1"] is True and db.record_permissions["f1"] == []
 
@@ -2469,20 +2643,25 @@ class TestCertificateSuggestion:
 class TestReviewFindings:
     """Paths an independent review found could lose an answer or keep a stale inherit edge."""
 
-    async def test_with_a_certificate_delta_reports_sharing_only_changes(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
+    async def test_with_a_certificate_delta_does_not_ask_for_sharing_changes(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
         inheritance_drive(tenant)
         serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
         await (await certificate_connector(db, checkpoints)).run_sync()
 
-        assert {r.headers.get("Prefer") for r in cloud.calls("GET", DELTA_PATH)} == {"deltashowsharingchanges"}, (
-            "an item that breaks inheritance changes only its sharing; unreported, it keeps its folder's audience"
+        assert {r.headers.get("Prefer") for r in cloud.calls("GET", DELTA_PATH)} == {None}, (
+            "without Graph Sites.FullControl.All a link asking for them dies at a folder's next sharing change"
         )
 
-    async def test_without_a_certificate_delta_is_asked_as_before(self, cloud, tenant, db, checkpoints) -> None:
-        inheritance_drive(tenant)
-        await (await ready_connector(db, checkpoints)).run_sync()
+    async def test_without_a_certificate_delta_does_not_ask_for_sharing_changes(self, cloud, tenant, db, checkpoints) -> None:
+        feed = inheritance_drive(tenant)
+        feed.by_token["D1"] = page([], delta_link=delta_link("u-ana", "D2"))
+        connector = await ready_connector(db, checkpoints)
+        await connector.run_sync()
+        await connector.run_sync()
 
+        assert feed.seen == [None, "D1"]
         assert {r.headers.get("Prefer") for r in cloud.calls("GET", DELTA_PATH)} == {None}
+        assert drive_checkpoint(checkpoints)["sharingChanges"] is False
 
     async def test_full_read_answers_of_a_pass_that_failed_are_queued(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
         feed = reordered_drive(tenant)
@@ -2521,6 +2700,11 @@ class TestReviewFindings:
             return await inherits(item)
 
         connector._inherits_parent_access = fails_for_f1
+        # The rewrite's page is held for the item a bounded number of times, then the item is queued.
+        for attempt in range(1, MAX_PAGE_ATTEMPTS):
+            await connector.run_sync()
+            assert permission_state(checkpoints).get("mode") is None
+            assert permission_state(checkpoints)["migrationHeldPageAttempts"] == attempt
         await connector.run_sync()
 
         assert permission_state(checkpoints)["mode"] == "inheritance"
@@ -2614,21 +2798,22 @@ class TestSharingChangesLink:
         await connector.run_sync()
 
         assert wrong == []
-        assert [r.headers.get("Prefer") for r in cloud.calls("GET", DELTA_PATH)][-1] == "deltashowsharingchanges"
+        assert [r.headers.get("Prefer") for r in cloud.calls("GET", DELTA_PATH)][-1] is None
         assert permission_state(checkpoints)["mode"] == "inheritance"
 
-    async def test_a_first_sync_with_a_certificate_makes_its_link_with_sharing_changes(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
+    async def test_a_first_sync_with_a_certificate_makes_its_link_without_sharing_changes(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
         inheritance_drive(tenant)
         serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
         await (await certificate_connector(db, checkpoints)).run_sync()
 
-        assert drive_checkpoint(checkpoints)["sharingChanges"] is True
-        assert {r.headers.get("Prefer") for r in cloud.calls("GET", DELTA_PATH)} == {"deltashowsharingchanges"}
+        assert drive_checkpoint(checkpoints)["sharingChanges"] is False
+        assert {r.headers.get("Prefer") for r in cloud.calls("GET", DELTA_PATH)} == {None}
 
-    async def test_removing_the_certificate_keeps_asking_the_link_as_it_was_made(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
+    async def test_a_link_an_earlier_version_made_with_sharing_changes_is_asked_as_it_was_made(self, cloud, tenant, db, checkpoints, sharepoint_rest) -> None:
         feed = inheritance_drive(tenant)
         serve_unique_items(cloud, FOLDER_UNIQUE_ID, SHARED_UNIQUE_ID, inheriting=(INHERITING_UNIQUE_ID,))
         await (await certificate_connector(db, checkpoints)).run_sync()
+        drive_checkpoint(checkpoints)["sharingChanges"] = True
         feed.by_token["D1"] = page([], delta_link=delta_link("u-ana", "D2"))
 
         await (await ready_connector(db, checkpoints)).run_sync()
@@ -2792,3 +2977,353 @@ class TestRunActionItems:
 
         assert codes(connector.last_action_items) == ["sharepoint_permission_missing"]
         assert connector.last_action_items[0].severity == "error"
+
+
+def records_of(db: FakeRecordsDb, drive: str = DRIVE) -> list[str]:
+    return sorted(k for k, r in db.records.items() if r.external_record_group_id == drive)
+
+
+class TestDrivesThatLeave:
+    """A OneDrive Microsoft says is gone leaves PipesHub; one it cannot open now stays as stored."""
+
+    async def synced_drive(self, tenant, db, checkpoints) -> OneDriveConnector:
+        feed = tenant.add_user("u-ana", "ana@acme.com", "Ana")
+        feed.by_token[None] = page([drive_item("f1", "one.pdf")], delta_link=delta_link("u-ana", "D1"))
+        connector = await ready_connector(db, checkpoints)
+        await connector.run_sync()
+        assert records_of(db) == ["f1"] and DRIVE in db.record_groups
+        return connector
+
+    async def test_a_drive_answering_404_is_removed_with_its_records_and_sync_state(self, cloud, tenant, db, checkpoints) -> None:
+        connector = await self.synced_drive(tenant, db, checkpoints)
+        cloud.on("GET", "/v1.0/users/u-ana/drive", graph_error(404, "ResourceNotFound", "User's mysite not found."))
+
+        await connector.run_sync()
+
+        assert records_of(db) == [] and DRIVE not in db.record_groups
+        assert drive_checkpoint(checkpoints) is None
+        assert checkpoints.values_for(_drive_permissions_key(DRIVE)) is None
+        assert json.loads(checkpoints.values_for("knownDrives/connector/users")["drives"]) == {}
+
+    async def test_a_locked_drive_keeps_its_records_and_a_full_sync_does_not_unlink_them(self, cloud, tenant, db, checkpoints) -> None:
+        connector = await self.synced_drive(tenant, db, checkpoints)
+        cloud.on("GET", "/v1.0/users/u-ana/drive", graph_error(423, "resourceLocked", "Site is locked."))
+        db.full_sync = True
+
+        await connector.run_sync()
+
+        assert records_of(db) == ["f1"]
+        assert db.kept_record_groups == [DRIVE]
+        assert db.kept_records == [db.records["f1"].id]
+        (warning,) = [n for n in await notes(connector) if n["title"] == "OneDrive: OneDrive blocked for some users"]
+        assert "ana@acme.com" in warning["message"]
+
+    async def test_an_unexpected_drive_check_error_keeps_the_drive_and_fails_the_run(self, cloud, tenant, db, checkpoints) -> None:
+        connector = await self.synced_drive(tenant, db, checkpoints)
+        cloud.on("GET", "/v1.0/users/u-ana/drive", graph_error(500, "generalException"))
+
+        await incomplete_run(connector)
+
+        assert records_of(db) == ["f1"]
+        assert connector.full_sync_coverage().complete is False
+        sent = await notes(connector)
+        assert "OneDrive: some OneDrives could not be synced" in notification_titles(sent)
+        assert not any("could not be synced" in t and t != "OneDrive: some OneDrives could not be synced"
+                       for t in notification_titles(sent))
+
+    async def test_the_drive_of_a_user_who_left_is_removed_once_graph_answers_404(self, cloud, tenant, db, checkpoints) -> None:
+        connector = await self.synced_drive(tenant, db, checkpoints)
+        tenant.users.clear()
+
+        await connector.run_sync()
+
+        assert records_of(db) == ["f1"], "kept while Microsoft still holds the OneDrive"
+
+        cloud.on("GET", "/v1.0/users/u-ana/drive", graph_error(404, "ResourceNotFound"))
+        await connector.run_sync()
+
+        assert records_of(db) == [] and DRIVE not in db.record_groups
+
+    async def test_the_drive_of_a_user_who_left_is_kept_by_a_full_sync_while_it_exists(self, cloud, tenant, db, checkpoints) -> None:
+        connector = await self.synced_drive(tenant, db, checkpoints)
+        tenant.users.clear()
+        db.full_sync = True
+
+        await connector.run_sync()
+
+        assert db.kept_record_groups == [DRIVE]
+
+    async def test_an_unexpected_answer_for_a_departed_users_drive_fails_the_run(self, cloud, tenant, db, checkpoints) -> None:
+        connector = await self.synced_drive(tenant, db, checkpoints)
+        tenant.users.clear()
+        cloud.on("GET", "/v1.0/users/u-ana/drive", graph_error(503, "serviceNotAvailable"))
+
+        failure = await incomplete_run(connector)
+
+        assert "departed user u-ana" in str(failure)
+        assert records_of(db) == ["f1"]
+        (note,) = [n for n in await notes(connector) if n["title"] == "OneDrive: part of the sync could not be read"]
+        assert "u-ana" in note["message"]
+
+
+class TestUserStatus:
+    """Accounts that can no longer sign in lose the access this connector wrote for them."""
+
+    async def test_a_disabled_user_is_not_synced_as_a_user_and_gets_no_grants(self, cloud, tenant, db, checkpoints) -> None:
+        feed = tenant.add_user("u-ana", "ana@acme.com", "Ana")
+        tenant.add_user("u-ben", "ben@acme.com", "Ben")
+        tenant.users[-1]["accountEnabled"] = False
+        feed.by_token[None] = page([drive_item("f1", "one.pdf")], delta_link=delta_link("u-ana", "D1"))
+        tenant.share("f1", [user_grant("u-ana", "ana@acme.com", "owner"), user_grant("u-ben", "ben@acme.com")])
+        tenant.add_group("g-eng", "Eng", [member("u-ana", "ana@acme.com"), member("u-ben", "ben@acme.com")])
+        cloud.on("GET", "/v1.0/users/u-ben/drive/root/delta", page([], delta_link=delta_link("u-ben", "B1")))
+        connector = await ready_connector(db, checkpoints)
+
+        await connector.run_sync()
+
+        assert [u.email for u in db.app_users] == ["ana@acme.com"]
+        assert perms(db, "f1") == {(EntityType.USER, "u-ana", "ana@acme.com", PermissionType.OWNER)}
+        assert db.user_groups == {"g-eng": ["ana@acme.com"]}
+        assert db.record_group_permissions["drive-ben"] == [], "no owner grant for an account that can't sign in"
+        assert db.access_removed == ["ben@acme.com"]
+
+    async def test_a_user_disabled_since_the_last_run_loses_their_grants_once(self, cloud, tenant, db, checkpoints) -> None:
+        feed = tenant.add_user("u-ana", "ana@acme.com", "Ana")
+        tenant.add_user("u-ben", "ben@acme.com", "Ben")
+        feed.by_token[None] = page([drive_item("f1", "one.pdf")], delta_link=delta_link("u-ana", "D1"))
+        tenant.share("f1", [user_grant("u-ana", "ana@acme.com", "owner"), user_grant("u-ben", "ben@acme.com")])
+        connector = await ready_connector(db, checkpoints)
+        await connector.run_sync()
+        assert db.access_removed == []
+
+        tenant.users[-1]["accountEnabled"] = False
+        await connector.run_sync()
+        await connector.run_sync()
+
+        assert db.access_removed == ["ben@acme.com"]
+        assert perms(db, "f1") == {(EntityType.USER, "u-ana", "ana@acme.com", PermissionType.OWNER)}
+
+    async def test_a_user_who_left_the_tenant_loses_their_grants(self, cloud, tenant, db, checkpoints) -> None:
+        tenant.add_user("u-ana", "ana@acme.com", "Ana").by_token[None] = page([], delta_link=delta_link("u-ana", "D1"))
+        tenant.add_user("u-ben", "ben@acme.com", "Ben").by_token[None] = page([], delta_link=delta_link("u-ben", "D1"))
+        connector = await ready_connector(db, checkpoints)
+        await connector.run_sync()
+
+        tenant.users.pop()
+        await connector.run_sync()
+
+        assert db.access_removed == ["ben@acme.com"]
+
+    async def test_a_returning_user_has_every_group_and_every_drives_access_read_again(self, cloud, tenant, db, checkpoints) -> None:
+        feed = tenant.add_user("u-ana", "ana@acme.com", "Ana")
+        tenant.add_user("u-ben", "ben@acme.com", "Ben")
+        tenant.users[-1]["accountEnabled"] = False
+        feed.by_token[None] = page([drive_item("f1", "one.pdf")], delta_link=delta_link("u-ana", "D1"))
+        tenant.share("f1", [user_grant("u-ana", "ana@acme.com", "owner"), user_grant("u-ben", "ben@acme.com")])
+        tenant.add_group("g-eng", "Eng", [member("u-ana", "ana@acme.com"), member("u-ben", "ben@acme.com")])
+        connector = await ready_connector(db, checkpoints)
+        await connector.run_sync()
+        assert db.user_groups == {"g-eng": ["ana@acme.com"]}
+        full_reads = len(cloud.calls("GET", "/v1.0/groups"))
+
+        tenant.users[-1]["accountEnabled"] = True
+        await connector.run_sync()
+
+        assert len(cloud.calls("GET", "/v1.0/groups")) == full_reads + 1
+        assert db.user_groups == {"g-eng": ["ana@acme.com", "ben@acme.com"]}
+        assert (EntityType.USER, "u-ben", "ben@acme.com", PermissionType.READ) in perms(db, "f1"), (
+            "rewritten by a pass over the drive, though nothing in it changed"
+        )
+        assert feed.seen == [None, "D1", None]
+        assert drive_checkpoint(checkpoints)["deltaLink"] == delta_link("u-ana", "D1"), "the pass leaves the drive's link"
+
+        await connector.run_sync()
+        assert feed.seen == [None, "D1", None, "D1"], "once"
+
+
+class TestItemsLeavingScope:
+    async def test_a_file_renamed_to_a_name_without_an_extension_is_removed(self, cloud, tenant, db, checkpoints) -> None:
+        feed = tenant.add_user("u-ana", "ana@acme.com", "Ana")
+        feed.by_token[None] = page([drive_item("f1", "one.pdf"), drive_item("f2", "two.pdf")], delta_link=delta_link("u-ana", "D1"))
+        feed.by_token["D1"] = page([drive_item("f1", "one", etag="v2")], delta_link=delta_link("u-ana", "D2"))
+        connector = await ready_connector(db, checkpoints)
+        await connector.run_sync()
+
+        await connector.run_sync()
+
+        assert records_of(db) == ["f2"]
+
+    async def test_a_new_file_without_an_extension_is_never_stored(self, cloud, tenant, db, checkpoints) -> None:
+        feed = tenant.add_user("u-ana", "ana@acme.com", "Ana")
+        feed.by_token[None] = page([drive_item("f1", "README"), drive_item("f2", "two.pdf")], delta_link=delta_link("u-ana", "D1"))
+        connector = await ready_connector(db, checkpoints)
+
+        await connector.run_sync()
+
+        assert records_of(db) == ["f2"]
+        assert db.deleted == []
+
+    async def test_a_file_renamed_out_of_the_extension_filter_is_removed(self, cloud, tenant, db, checkpoints) -> None:
+        feed = tenant.add_user("u-ana", "ana@acme.com", "Ana")
+        feed.by_token[None] = page([drive_item("f1", "one.pdf")], delta_link=delta_link("u-ana", "D1"))
+        feed.by_token["D1"] = page([drive_item("f1", "one.txt", etag="v2")], delta_link=delta_link("u-ana", "D2"))
+        connector = await ready_connector(db, checkpoints, filters={"file_extensions": {"operator": "in", "value": ["pdf"], "type": "multiselect"}})
+        await connector.run_sync()
+        assert records_of(db) == ["f1"]
+
+        await connector.run_sync()
+
+        assert records_of(db) == []
+
+    async def test_a_deleted_folder_takes_the_stored_items_graph_confirms_gone(self, cloud, tenant, db, checkpoints) -> None:
+        feed = tenant.add_user("u-ana", "ana@acme.com", "Ana")
+        feed.by_token[None] = page([
+            drive_item("d1", "Plans", folder=True),
+            drive_item("d2", "Old", folder=True, parent="d1"),
+            drive_item("f1", "gone.pdf", parent="d2"),
+            drive_item("f2", "moved.pdf", parent="d1"),
+        ], delta_link=delta_link("u-ana", "D1"))
+        # Graph reports the deleted folder alone.
+        feed.by_token["D1"] = page([drive_item("d1", "Plans", folder=True, deleted=True)], delta_link=delta_link("u-ana", "D2"))
+        cloud.on("GET", f"/v1.0/drives/{DRIVE}/items/f2", drive_item("f2", "moved.pdf", parent="elsewhere"))
+        connector = await ready_connector(db, checkpoints)
+        await connector.run_sync()
+
+        await connector.run_sync()
+
+        assert records_of(db) == ["f2"], "f2 was moved out before the delete; its own change moves its record"
+        # d2 and f1 are unrouted, so Graph answers 404 for them: confirmed gone.
+        assert cloud.calls("GET", f"/v1.0/drives/{DRIVE}/items/f1") and cloud.calls("GET", f"/v1.0/drives/{DRIVE}/items/d2")
+
+    async def test_a_deleted_folder_keeps_its_items_when_graph_cannot_say(self, cloud, tenant, db, checkpoints) -> None:
+        feed = tenant.add_user("u-ana", "ana@acme.com", "Ana")
+        feed.by_token[None] = page(
+            [drive_item("d1", "Plans", folder=True), drive_item("f1", "plan.pdf", parent="d1")], delta_link=delta_link("u-ana", "D1")
+        )
+        feed.by_token["D1"] = page([drive_item("d1", "Plans", folder=True, deleted=True)], delta_link=delta_link("u-ana", "D2"))
+        cloud.on("GET", f"/v1.0/drives/{DRIVE}/items/f1", graph_error(503, "serviceNotAvailable"))
+        connector = await ready_connector(db, checkpoints)
+        await connector.run_sync()
+
+        await incomplete_run(connector)
+
+        assert records_of(db) == ["d1", "f1"]
+        assert drive_checkpoint(checkpoints)["deltaLink"] == delta_link("u-ana", "D1")
+
+
+class TestExpiredDriveDeltaToken:
+    async def test_a_410_reads_the_drive_again_and_removes_what_graph_confirms_gone(self, cloud, tenant, db, checkpoints) -> None:
+        feed = tenant.add_user("u-ana", "ana@acme.com", "Ana")
+        feed.by_token[None] = [
+            page([drive_item("f1", "one.pdf"), drive_item("f2", "two.pdf"), drive_item("f3", "three.pdf")],
+                 delta_link=delta_link("u-ana", "D1")),
+            page([drive_item("f1", "one.pdf")], delta_link=delta_link("u-ana", "R1")),
+        ]
+        feed.by_token["D1"] = graph_error(410, "resyncRequired", "Resync required.")
+        # f3 is not listed but still answers: it is not known to be gone.
+        cloud.on("GET", f"/v1.0/drives/{DRIVE}/items/f3", drive_item("f3", "three.pdf"))
+        connector = await ready_connector(db, checkpoints)
+        await connector.run_sync()
+
+        await connector.run_sync()
+
+        assert records_of(db) == ["f1", "f3"]
+        assert feed.seen == [None, "D1", None]
+        assert drive_checkpoint(checkpoints)["deltaLink"] == delta_link("u-ana", "R1")
+        assert drive_checkpoint(checkpoints)["resyncPending"] is False
+        (note,) = [n for n in await notes(connector) if n["title"] == "OneDrive: OneDrives read again from the start"]
+        assert "ana@acme.com" in note["message"]
+
+    async def test_an_interrupted_read_again_starts_over_next_run(self, cloud, tenant, db, checkpoints) -> None:
+        feed = tenant.add_user("u-ana", "ana@acme.com", "Ana")
+        feed.by_token[None] = [
+            page([drive_item("f1", "one.pdf"), drive_item("f2", "two.pdf")], delta_link=delta_link("u-ana", "D1")),
+            page([drive_item("f1", "one.pdf")], next_link=delta_link("u-ana", "P2")),
+        ]
+        feed.by_token["D1"] = graph_error(410, "resyncRequired")
+        feed.by_token["P2"] = [graph_error(400, "invalidRequest", "page unavailable"), page([], delta_link=delta_link("u-ana", "R1"))]
+        connector = await ready_connector(db, checkpoints)
+        await connector.run_sync()
+
+        await incomplete_run(connector)
+        assert drive_checkpoint(checkpoints)["resyncPending"] is True
+        assert records_of(db) == ["f1", "f2"], "nothing is removed before the listing is complete"
+
+        await connector.run_sync()
+
+        assert feed.seen[-2:] == [None, "P2"], "the listing starts over: what it saw is not kept"
+        assert records_of(db) == ["f1"]
+        assert drive_checkpoint(checkpoints)["resyncPending"] is False
+
+
+class TestSharingChangeAnnotation:
+    async def test_a_folder_whose_sharing_changed_has_its_files_access_read_again(self, cloud, tenant, db, checkpoints) -> None:
+        feed = tenant.add_user("u-ana", "ana@acme.com", "Ana")
+        feed.by_token[None] = page(
+            [drive_item("d1", "Plans", folder=True, shared=True), drive_item("f1", "plan.pdf", parent="d1")],
+            delta_link=delta_link("u-ana", "D1"),
+        )
+        changed = drive_item("d1", "Plans", folder=True, shared=True)
+        changed["@microsoft.graph.sharedChanged"] = "True"
+        feed.by_token["D1"] = page([changed], delta_link=delta_link("u-ana", "D2"))
+        tenant.share("d1", [user_grant("u-ben", "ben@acme.com")])
+        tenant.share("f1", [user_grant("u-ben", "ben@acme.com")])
+        connector = await ready_connector(db, checkpoints)
+        await connector.run_sync()
+        # Cal is added to the folder; Ben, removed. The shared flag does not change.
+        tenant.share("d1", [user_grant("u-cal", "cal@acme.com")])
+        tenant.share("f1", [user_grant("u-cal", "cal@acme.com")])
+        cloud.on("GET", f"/v1.0/drives/{DRIVE}/items/d1/children", page([drive_item("f1", "plan.pdf", parent="d1")]))
+
+        await connector.run_sync()
+
+        assert perms(db, "f1") == {(EntityType.USER, "u-cal", "cal@acme.com", PermissionType.READ)}
+        assert cloud.calls("GET", f"/v1.0/drives/{DRIVE}/items/d1/children")
+
+    async def test_a_folder_without_the_annotation_is_not_walked(self, cloud, tenant, db, checkpoints) -> None:
+        feed = tenant.add_user("u-ana", "ana@acme.com", "Ana")
+        feed.by_token[None] = page(
+            [drive_item("d1", "Plans", folder=True, shared=True), drive_item("f1", "plan.pdf", parent="d1")],
+            delta_link=delta_link("u-ana", "D1"),
+        )
+        feed.by_token["D1"] = page([drive_item("d1", "Plans renamed", folder=True, shared=True, etag="v2")], delta_link=delta_link("u-ana", "D2"))
+        connector = await ready_connector(db, checkpoints)
+        await connector.run_sync()
+
+        await connector.run_sync()
+
+        assert cloud.calls("GET", f"/v1.0/drives/{DRIVE}/items/d1/children") == []
+
+
+class TestFilesReadAllProbe:
+    async def test_a_403_reading_a_onedrive_names_files_read_all(self, cloud, tenant, db, checkpoints) -> None:
+        tenant.add_user("u-ana", "ana@acme.com", "Ana")
+        cloud.on("GET", "/v1.0/users/u-ana/drive", graph_error(403, "accessDenied", "Access denied"))
+        connector = await ready_connector(db, checkpoints)
+
+        with pytest.raises(ConnectionError, match="Files.Read.All"):
+            await connector.test_connection_and_access()
+
+        (note,) = await notes(connector)
+        assert note["title"] == "OneDrive: missing API permissions"
+        assert "Files.Read.All" in note["message"]
+
+    @pytest.mark.parametrize("status, code", [(404, "ResourceNotFound"), (423, "resourceLocked")])
+    async def test_a_user_without_a_readable_onedrive_passes_to_the_next(self, cloud, tenant, db, checkpoints, status, code) -> None:
+        tenant.add_user("u-ana", "ana@acme.com", "Ana")
+        tenant.add_user("u-ben", "ben@acme.com", "Ben")
+        cloud.on("GET", "/v1.0/users/u-ana/drive", graph_error(status, code))
+        connector = await ready_connector(db, checkpoints)
+
+        assert await connector.test_connection_and_access() is True
+
+        assert cloud.calls("GET", "/v1.0/users/u-ben/drive")
+
+    async def test_the_users_are_listed_ten_at_most(self, cloud, tenant, db, checkpoints) -> None:
+        tenant.add_user("u-ana", "ana@acme.com", "Ana")
+        connector = await ready_connector(db, checkpoints)
+
+        await connector.test_connection_and_access()
+
+        listings = [MicrosoftCloudStub.query(r) for r in cloud.calls("GET", "/v1.0/users")]
+        assert {"$top": "10", "$select": "id"} in listings

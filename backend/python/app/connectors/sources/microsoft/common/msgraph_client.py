@@ -229,6 +229,23 @@ class MSGraphClient:
                 raise
             return []
 
+    async def get_group_transitive_members(self, group_id: str) -> List[Any]:
+        """Every member of a group at any depth: users, and the groups nested in it. Raises when any page can't be
+        read, so a partial list can't replace a group's stored members."""
+        members: List[Any] = []
+        builder = self.client.groups.by_group_id(group_id).transitive_members
+        async with self.rate_limiter:
+            result = await builder.get()
+        while result:
+            if result.value:
+                members.extend(result.value)
+            if getattr(result, 'odata_next_link', None):
+                async with self.rate_limiter:
+                    result = await builder.with_url(result.odata_next_link).get()
+            else:
+                break
+        return members
+
     async def get_all_users(self) -> List[AppUser]:
         """
         Retrieves a list of all users in the organization.

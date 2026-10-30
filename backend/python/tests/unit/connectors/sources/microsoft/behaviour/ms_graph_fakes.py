@@ -292,6 +292,13 @@ class FakeRecordsDb:
         self.inherit_edges: dict[str, bool] = {}
         # The store the processor reads stored edges from (the connector's data store provider).
         self.edge_store: Any = None
+        self.withdrawn: list[Any] = []
+        self.withdrawn_ids: set[str] = set()
+        self.full_sync = False
+        self.kept_records: list[str] = []
+        self.kept_record_groups: list[str] = []
+        # Emails whose direct grants on the connector's content were taken away, in order.
+        self.access_removed: list[str] = []
 
     def add_active_user(self, email: str) -> None:
         self.active_users.append(type("ActiveUser", (), {"email": email})())
@@ -448,6 +455,39 @@ class FakeRecordsDb:
 
     async def on_new_app_users(self, users: list[Any]) -> None:
         self.app_users.extend(users)
+
+    async def get_all_app_users(self, connector_id: str, *, raise_on_error: bool = False) -> list[Any]:
+        latest: dict[str, Any] = {}
+        for user in self.app_users:
+            latest[user.source_user_id] = user
+        return [u for u in latest.values() if u.source_user_id not in self.withdrawn_ids]
+
+    async def withdraw_app_user_access(self, connector_id: str, users: list[Any]) -> None:
+        self.withdrawn.extend(users)
+        self.withdrawn_ids.update(u.source_user_id for u in users)
+
+    async def remove_user_access_to_connector(self, connector_id: str, user_email: str) -> int:
+        """Removes the user's direct grants on records, drives and groups; returns how many went."""
+        self.access_removed.append(user_email)
+        removed = 0
+        for grants in (*self.record_permissions.values(), *self.record_group_permissions.values()):
+            kept = [p for p in grants if (p.email or "").lower() != user_email.lower()]
+            removed += len(grants) - len(kept)
+            grants[:] = kept
+        for members in self.user_groups.values():
+            if user_email in members:
+                members.remove(user_email)
+                removed += 1
+        return removed
+
+    def full_sync_running(self, connector_id: str) -> bool:
+        return self.full_sync
+
+    def note_kept_records(self, connector_id: str, record_ids: list[str]) -> None:
+        self.kept_records.extend(record_ids)
+
+    async def note_kept_record_group(self, connector_id: str, external_group_id: str) -> None:
+        self.kept_record_groups.append(external_group_id)
 
     async def get_all_active_users(self) -> list[Any]:
         return list(self.active_users)
