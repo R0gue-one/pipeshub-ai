@@ -7,6 +7,7 @@ import pytest
 from msgraph.generated.models.o_data_errors.main_error import MainError
 from msgraph.generated.models.o_data_errors.o_data_error import ODataError
 
+from app.connectors.core.base.connector.connector_service import ConnectorInitError
 from app.connectors.sources.microsoft.onedrive.connector import (
     OneDriveConnector,
     OneDriveUserStatus,
@@ -663,7 +664,7 @@ class TestConnectionAndAccessNotifications:
         connector._probe_groups_scope = AsyncMock()
         connector._probe_files_scope = AsyncMock(side_effect=_make_403_odata_error())
 
-        with pytest.raises(ConnectionError, match=r"Files\.Read\.All"):
+        with pytest.raises(ConnectorInitError, match=r"Files\.Read\.All"):
             await connector.test_connection_and_access()
 
         _assert_notify(
@@ -681,7 +682,7 @@ class TestConnectionAndAccessNotifications:
         connector._probe_groups_scope = AsyncMock()
         connector._probe_files_scope = AsyncMock()
 
-        with pytest.raises(ConnectionError, match=r"User\.Read\.All"):
+        with pytest.raises(ConnectorInitError, match=r"User\.Read\.All"):
             await connector.test_connection_and_access()
 
         _assert_notify(
@@ -699,7 +700,7 @@ class TestConnectionAndAccessNotifications:
         connector._probe_groups_scope = AsyncMock(side_effect=_make_403_odata_error())
         connector._probe_files_scope = AsyncMock()
 
-        with pytest.raises(ConnectionError, match=r"Group\.Read\.All"):
+        with pytest.raises(ConnectorInitError, match=r"Group\.Read\.All"):
             await connector.test_connection_and_access()
 
         _assert_notify(
@@ -718,7 +719,7 @@ class TestConnectionAndAccessNotifications:
         connector._probe_files_scope = AsyncMock()
 
         with pytest.raises(
-            ConnectionError,
+            ConnectorInitError,
             match=r"User\.Read\.All.*Group\.Read\.All|Group\.Read\.All.*User\.Read\.All",
         ):
             await connector.test_connection_and_access()
@@ -737,7 +738,7 @@ class TestConnectionAndAccessNotifications:
         connector._probe_files_scope = AsyncMock()
 
         with pytest.raises(
-            ConnectionError,
+            ConnectorInitError,
             match=(
                 r"ServiceUnavailable: Microsoft Graph is temporarily unavailable "
                 r"\(HTTP 503\)"
@@ -755,7 +756,7 @@ class TestConnectionAndAccessNotifications:
         connector._probe_files_scope = AsyncMock()
 
         with pytest.raises(
-            ConnectionError,
+            ConnectorInitError,
             match=(
                 "Unable to check Microsoft Graph permission "
                 "User.Read.All: network down"

@@ -50,6 +50,7 @@ from app.config.constants.arangodb import Connectors, OriginTypes
 from app.connectors.core.base.connector.connector_service import (
     BaseConnector,
     ConnectionCheckResult,
+    ConnectorInitError,
 )
 from app.connectors.sources.microsoft.common.msgraph_client import MSGraphClient
 from app.connectors.sources.microsoft.onedrive.connector import (
@@ -391,7 +392,7 @@ class TestRealClientsAndTokens:
         cloud.on("GET", "/v1.0/groups", graph_error(403, "Authorization_RequestDenied", "Insufficient privileges"))
         connector = await ready_connector(db, checkpoints)
 
-        with pytest.raises(ConnectionError, match="Group.Read.All"):
+        with pytest.raises(ConnectorInitError, match="Group.Read.All"):
             await connector.test_connection_and_access()
 
         (note,) = await notes(connector)
@@ -3303,7 +3304,7 @@ class TestFilesReadAllProbe:
         cloud.on("GET", "/v1.0/users/u-ana/drive", graph_error(403, "accessDenied", "Access denied"))
         connector = await ready_connector(db, checkpoints)
 
-        with pytest.raises(ConnectionError, match="Files.Read.All"):
+        with pytest.raises(ConnectorInitError, match="Files.Read.All"):
             await connector.test_connection_and_access()
 
         (note,) = await notes(connector)

@@ -8,6 +8,7 @@ import pytest
 from fastapi import HTTPException
 
 from app.config.constants.arangodb import Connectors, MimeTypes, OriginTypes, ProgressStatus
+from app.connectors.core.base.connector.connector_service import ConnectorInitError
 from app.connectors.sources.microsoft.common.msgraph_client import RecordUpdate
 from app.connectors.sources.microsoft.onedrive.connector import (
     DrivePageIncompleteError,
@@ -4264,7 +4265,7 @@ class TestConnectionAndAccess:
         connector._probe_files_scope = AsyncMock()
         connector.notify = AsyncMock()
 
-        with pytest.raises(ConnectionError, match=r"User\.Read\.All"):
+        with pytest.raises(ConnectorInitError, match=r"User\.Read\.All"):
             await connector.test_connection_and_access()
 
         connector.notify.assert_awaited_once()
@@ -4278,7 +4279,7 @@ class TestConnectionAndAccess:
         connector._probe_files_scope = AsyncMock()
         connector.notify = AsyncMock()
 
-        with pytest.raises(ConnectionError, match=r"Group\.Read\.All"):
+        with pytest.raises(ConnectorInitError, match=r"Group\.Read\.All"):
             await connector.test_connection_and_access()
 
         connector.notify.assert_awaited_once()
@@ -4292,7 +4293,7 @@ class TestConnectionAndAccess:
         connector._probe_files_scope = AsyncMock(side_effect=_make_403_odata_error_cov())
         connector.notify = AsyncMock()
 
-        with pytest.raises(ConnectionError, match=r"Files\.Read\.All"):
+        with pytest.raises(ConnectorInitError, match=r"Files\.Read\.All"):
             await connector.test_connection_and_access()
 
         connector.notify.assert_awaited_once()
@@ -4307,7 +4308,7 @@ class TestConnectionAndAccess:
         connector.notify = AsyncMock()
 
         with pytest.raises(
-            ConnectionError,
+            ConnectorInitError,
             match=r"User\.Read\.All.*Group\.Read\.All",
         ):
             await connector.test_connection_and_access()
@@ -4326,7 +4327,7 @@ class TestConnectionAndAccess:
         connector._probe_files_scope = AsyncMock()
         connector.notify = AsyncMock()
 
-        with pytest.raises(ConnectionError, match=r"ServiceUnavailable.*HTTP 503"):
+        with pytest.raises(ConnectorInitError, match=r"ServiceUnavailable.*HTTP 503"):
             await connector.test_connection_and_access()
 
         connector.notify.assert_not_called()
@@ -4341,7 +4342,7 @@ class TestConnectionAndAccess:
         connector.notify = AsyncMock()
 
         with pytest.raises(
-            ConnectionError,
+            ConnectorInitError,
             match="Unable to check Microsoft Graph permission User.Read.All",
         ):
             await connector.test_connection_and_access()

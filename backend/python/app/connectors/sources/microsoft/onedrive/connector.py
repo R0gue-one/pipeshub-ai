@@ -41,7 +41,12 @@ from app.config.constants.arangodb import (
     ProgressStatus,
 )
 from app.connectors.core.constants import IconPaths
-from app.connectors.core.base.connector.connector_service import ActionItem, BaseConnector, ConnectionCheckResult
+from app.connectors.core.base.connector.connector_service import (
+    ActionItem,
+    BaseConnector,
+    ConnectionCheckResult,
+    ConnectorInitError,
+)
 from app.connectors.core.base.data_processor.data_source_entities_processor import (
     DataSourceEntitiesProcessor,
 )
@@ -3782,15 +3787,14 @@ class OneDriveConnector(BaseConnector):
 
     async def test_connection_and_access(self) -> bool:
         """
-        Probe the Microsoft Graph directory permissions used during sync:
+        Probe the Microsoft Graph permissions used during sync:
           - User.Read.All  → GET /users?$top=1&$select=id
           - Group.Read.All → GET /groups?$top=1&$select=id
+          - Files.Read.All → the first OneDrive found among the first users
 
-        Drive access is checked for each active user during file sync. Microsoft
-        Graph can return the same 404 response for an unprovisioned drive and
-        insufficient file access, so these cases cannot be distinguished here.
-
-        Returns True only when both directory probes succeed.
+        Returns True when all three probes succeed. Otherwise raises ConnectorInitError, whose message the
+        enable request shows to the admin: the missing permissions by name, or the Graph error that stopped a
+        probe. A missing permission also sends the creator a notification.
         """
         self.logger.info("Testing connection and access to OneDrive")
 
@@ -3819,7 +3823,7 @@ class OneDriveConnector(BaseConnector):
                         f"(code={error_code}): {e}",
                         exc_info=True,
                     )
-                    raise ConnectionError(
+                    raise ConnectorInitError(
                         f"Microsoft Graph error while checking {scope_name}: "
                         f"{sanitize_graph_error(e)}"
                     ) from e
@@ -3828,7 +3832,7 @@ class OneDriveConnector(BaseConnector):
                     f"❌ Error testing {scope_name} permission: {e}",
                     exc_info=True,
                 )
-                raise ConnectionError(
+                raise ConnectorInitError(
                     f"Unable to check Microsoft Graph permission {scope_name}: "
                     f"{sanitize_azure_error(e)}"
                 ) from e
@@ -3851,7 +3855,7 @@ class OneDriveConnector(BaseConnector):
                     "connector_scope": self.scope,
                 },
             )
-            raise ConnectionError(message)
+            raise ConnectorInitError(message)
 
         return True
 
