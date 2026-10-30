@@ -185,7 +185,7 @@ class MSGraphClient:
                 else:
                     break
 
-            self.logger.info(f"Retrieved {len(groups)} groups.")
+            self.logger.debug(f"Retrieved {len(groups)} groups.")
             return groups
         except ODataError as e:
             self.logger.error(f"Error fetching groups: {e}")
@@ -279,7 +279,7 @@ class MSGraphClient:
                 else:
                     break
 
-            self.logger.info(f"Retrieved {len(users)} users.")
+            self.logger.debug(f"Retrieved {len(users)} users.")
 
             user_list: List[AppUser] = []
             for user in users:
@@ -414,7 +414,7 @@ class MSGraphClient:
             if hasattr(result, 'odata_delta_link') and result.odata_delta_link:
                 response['delta_link'] = result.odata_delta_link
 
-            self.logger.info(f"Retrieved delta response with {len(response['drive_items'])} items")
+            self.logger.debug(f"Retrieved delta response with {len(response['drive_items'])} items")
             return response
 
         except Exception as ex:
@@ -467,7 +467,7 @@ class MSGraphClient:
                 if hasattr(result, 'odata_delta_link') and result.odata_delta_link:
                     response['delta_link'] = result.odata_delta_link
 
-                self.logger.info(f"Retrieved delta response with {len(response['drive_items'])} items")
+                self.logger.debug(f"Retrieved delta response with {len(response['drive_items'])} items")
                 return response
 
         except Exception as ex:
@@ -518,7 +518,7 @@ class MSGraphClient:
                 if hasattr(result, 'odata_delta_link') and result.odata_delta_link:
                     response['delta_link'] = result.odata_delta_link
 
-            self.logger.info(f"Retrieved groups delta response with {len(response['groups'])} groups")
+            self.logger.debug(f"Retrieved groups delta response with {len(response['groups'])} groups")
             return response
 
         except Exception as ex:
@@ -557,7 +557,7 @@ class MSGraphClient:
                 else:
                     break
 
-            self.logger.info(f"Retrieved {len(permissions)} permissions for file ID {item_id}.")
+            self.logger.debug(f"Retrieved {len(permissions)} permissions for file ID {item_id}.")
             return permissions
         except ODataError as e:
             self.logger.error(f"Error fetching file permissions for File ID {item_id}: {e}")
@@ -642,7 +642,7 @@ class MSGraphClient:
                 else:
                     break
 
-            self.logger.info(f"Retrieved {len(children)} children for folder {folder_id}")
+            self.logger.debug(f"Retrieved {len(children)} children for folder {folder_id}")
             return children
 
         except ODataError as e:

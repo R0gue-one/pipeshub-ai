@@ -1,4 +1,5 @@
 import asyncio
+from collections import Counter
 import base64
 import binascii
 import uuid
@@ -629,6 +630,8 @@ class OneDriveConnector(BaseConnector):
         self._read_again: list[str] = []
         self._user_emails: dict[str, str] = {}
         self._health = RunHealth()
+        # Records written this run, for the one summary line per run.
+        self._tally: Counter[str] = Counter()
         # Accounts that can't sign in (disabled, or gone from the tenant): no grant is written for them.
         self._inactive_emails: set[str] = set()
         # Accounts active again: their grants, removed while they were not, are written back this run.
@@ -675,7 +678,7 @@ class OneDriveConnector(BaseConnector):
         # This prevents "HTTP transport has already been closed" errors
         try:
             await self.credential.get_token("https://graph.microsoft.com/.default")
-            self.logger.info("✅ Credential initialized and HTTP session established")
+            self.logger.debug("✅ Credential initialized and HTTP session established")
         except Exception as token_error:
             self.logger.error(f"❌ Failed to initialize credential: {token_error}")
             await self._notices.sign_in_failed()
@@ -969,7 +972,7 @@ class OneDriveConnector(BaseConnector):
             # Before the filters: OneDrive for Business sends deleted items without a
             # name or dates, which the filters would read as "doesn't match" and skip.
             if hasattr(item, 'deleted') and item.deleted is not None:
-                self.logger.info(f"Item {item.id} has been deleted")
+                self.logger.debug(f"Item {item.id} has been deleted")
                 return RecordUpdate(
                     record=None,
                     external_record_id=item.id,
@@ -1197,7 +1200,7 @@ class OneDriveConnector(BaseConnector):
         if existing is None:
             self.logger.debug(f"Skipping item {item.name} (ID: {item.id}): outside the sync filters")
             return None
-        self.logger.info(f"Item {item.id} ({item.name}) left the sync filters; removing its record")
+        self.logger.debug(f"Item {item.id} ({item.name}) left the sync filters; removing its record")
         return RecordUpdate(record=None, external_record_id=item.id, is_new=False, is_updated=False,
                             is_deleted=True, metadata_changed=False, content_changed=False,
                             permissions_changed=False)
@@ -1512,7 +1515,7 @@ class OneDriveConnector(BaseConnector):
                         record=existing_child_record,
                         permissions=converted_permissions
                     )
-                    self.logger.info(f"Updated permissions for child item {child.id}")
+                    self.logger.debug(f"Updated permissions for child item {child.id}")
 
                 # If this child is also a folder, recurse
                 if child.folder is not None:
@@ -1621,26 +1624,28 @@ class OneDriveConnector(BaseConnector):
                     await self.data_entities_processor.on_record_deleted(
                         record_id=dbRecord.id
                     )
+                    self._tally["removed"] += 1
 
             elif record_update.is_new:
                 # Handle new record - this will be done through the normal flow
-                self.logger.info(f"New record detected: {record_update.record.record_name}")
+                self.logger.debug(f"New record detected: {record_update.record.record_name}")
 
             elif record_update.is_updated:
+                self._tally["updated"] += 1
                 # Handle updates based on what changed
                 if record_update.metadata_changed:
-                    self.logger.info(f"Metadata changed for record: {record_update.record.record_name}")
+                    self.logger.debug(f"Metadata changed for record: {record_update.record.record_name}")
                     await self.data_entities_processor.on_record_metadata_update(record_update.record)
 
                 if record_update.permissions_changed:
-                    self.logger.info(f"Permissions changed for record: {record_update.record.record_name}")
+                    self.logger.debug(f"Permissions changed for record: {record_update.record.record_name}")
                     await self.data_entities_processor.on_updated_record_permissions(
                         record_update.record,
                         record_update.new_permissions
                     )
 
                 if record_update.content_changed:
-                    self.logger.info(f"Content changed for record: {record_update.record.record_name}")
+                    self.logger.debug(f"Content changed for record: {record_update.record.record_name}")
                     await self.data_entities_processor.on_record_content_update(record_update.record)
 
         except Exception as e:
@@ -1710,7 +1715,7 @@ class OneDriveConnector(BaseConnector):
             delta_link = (sync_point.get('deltaLink') or sync_point.get('nextLink')) if sync_point else None
 
             if delta_link is None:
-                self.logger.info("No sync point found, performing initial full sync...")
+                self.logger.debug("No sync point found, performing initial full sync...")
 
                 # IMPORTANT: Get delta link BEFORE full sync to avoid missing changes
                 # that occur during the sync
@@ -1732,7 +1737,7 @@ class OneDriveConnector(BaseConnector):
                             "membersTransitive": True,
                         }
                     )
-                    self.logger.info("Initial sync completed and delta link saved for future syncs")
+                    self.logger.debug("Initial sync completed and delta link saved for future syncs")
                 else:
                     self.logger.warning("Initial sync completed but no delta link was obtained")
                 if not all_groups_read:
@@ -1759,7 +1764,7 @@ class OneDriveConnector(BaseConnector):
                 # again, and that must not be cleared by this full sync's outcome.
                 await self._perform_delta_sync(delta_link, sync_point_key)
             else:
-                self.logger.info("Sync point found, performing incremental delta sync...")
+                self.logger.debug("Sync point found, performing incremental delta sync...")
                 await self._perform_delta_sync(delta_link, sync_point_key)
 
         except ODataError as e:
@@ -1792,7 +1797,7 @@ class OneDriveConnector(BaseConnector):
         Returns:
             The deltaLink string, or None if unable to obtain one.
         """
-        self.logger.info("Obtaining delta link checkpoint before full sync...")
+        self.logger.debug("Obtaining delta link checkpoint before full sync...")
 
         url = "https://graph.microsoft.com/v1.0/groups/delta"
 
@@ -1807,7 +1812,7 @@ class OneDriveConnector(BaseConnector):
                 if result.get('next_link'):
                     url = result.get('next_link')
                 elif result.get('delta_link'):
-                    self.logger.info("Delta link obtained successfully")
+                    self.logger.debug("Delta link obtained successfully")
                     return result.get('delta_link')
                 else:
                     self.logger.warning("Delta initialization: no next_link or delta_link received")
@@ -1825,7 +1830,7 @@ class OneDriveConnector(BaseConnector):
         Returns:
             True if every group and its members were read.
         """
-        self.logger.info("Starting initial full user group synchronization")
+        self.logger.debug("Starting initial full user group synchronization")
 
         groups = await self.msgraph_client.get_all_user_groups()
 
@@ -1944,13 +1949,13 @@ class OneDriveConnector(BaseConnector):
             self.logger.warning("No valid URL in sync point, falling back to full delta sync")
             url = "https://graph.microsoft.com/v1.0/groups/delta"
 
-        self.logger.info("Starting incremental delta sync...")
+        self.logger.debug("Starting incremental delta sync...")
 
         while True:
             result = await self.msgraph_client.get_groups_delta_response(url)
             groups = result.get('groups', [])
 
-            self.logger.info(f"Fetched delta page with {len(groups)} group changes")
+            self.logger.debug(f"Fetched delta page with {len(groups)} group changes")
 
             unapplied: list[str] = []
             failed_deletes: list[str] = []
@@ -1961,7 +1966,7 @@ class OneDriveConnector(BaseConnector):
                     changed.add(group.id)
                 # Handle group DELETION
                 if hasattr(group, 'additional_data') and group.additional_data and '@removed' in group.additional_data:
-                    self.logger.info(f"[DELTA] 🗑️ REMOVE Group: {group.id}")
+                    self.logger.debug(f"[DELTA] 🗑️ REMOVE Group: {group.id}")
                     success = await self.handle_delete_group(group.id)
                     if not success:
                         self.logger.error(f"❌ Error handling group delete for {group.id}")
@@ -1970,7 +1975,7 @@ class OneDriveConnector(BaseConnector):
                     continue
 
                 # Handle ADD/UPDATE
-                self.logger.info(f"[DELTA] ✅ ADD/UPDATE Group: {getattr(group, 'display_name', 'N/A')} ({group.id})")
+                self.logger.debug(f"[DELTA] ✅ ADD/UPDATE Group: {getattr(group, 'display_name', 'N/A')} ({group.id})")
                 outcome = await self.handle_group_create(group)
                 if outcome is False:
                     self.logger.error(f"❌ Error handling group create for {group.id}")
@@ -1986,7 +1991,7 @@ class OneDriveConnector(BaseConnector):
                 member_changes = (group.additional_data or {}).get('members@delta', [])
 
                 if member_changes:
-                    self.logger.info(f"    -> [DELTA] 👥 Processing {len(member_changes)} member changes for group: {group.id}")
+                    self.logger.debug(f"    -> [DELTA] 👥 Processing {len(member_changes)} member changes for group: {group.id}")
 
                 for member_change in member_changes:
                     if not await self._process_member_change(group.id, member_change) and group.id not in unapplied:
@@ -2047,7 +2052,7 @@ class OneDriveConnector(BaseConnector):
                     sync_point_key,
                     {"nextLink": None, "deltaLink": result.get('delta_link'), "heldPage": None, "heldPageAttempts": 0}
                 )
-                self.logger.info("Delta sync completed, delta link saved for next run")
+                self.logger.debug("Delta sync completed, delta link saved for next run")
                 break
             else:
                 self.logger.warning("Received response with neither next_link nor delta_link")
@@ -2079,7 +2084,7 @@ class OneDriveConnector(BaseConnector):
             self.logger.error(f"❌ Could not look up member {user_id} to remove from group {group_id}")
             return False
 
-        self.logger.info(f"    -> [DELTA] 👤⛔ REMOVING member: {email} ({user_id}) from group {group_id}")
+        self.logger.debug(f"    -> [DELTA] 👤⛔ REMOVING member: {email} ({user_id}) from group {group_id}")
         try:
             success = await self.data_entities_processor.on_user_group_member_removed(
                 external_group_id=group_id,
@@ -2123,7 +2128,7 @@ class OneDriveConnector(BaseConnector):
         """Read a group's members and save it. Raises GraphReadFailedError if they can't be read."""
         app_users = await self._collect_group_users(group)
         await self.data_entities_processor.on_new_user_groups([(self._to_app_user_group(group), app_users)])
-        self.logger.info(f"Processed group creation/update for: {group.display_name} with {len(app_users)} user members")
+        self.logger.debug(f"Processed group creation/update for: {group.display_name} with {len(app_users)} user members")
 
 
     def _create_app_user_from_member(self, member) -> Optional[AppUser]:
@@ -2163,7 +2168,7 @@ class OneDriveConnector(BaseConnector):
             True if group deletion was successful, False otherwise.
         """
         try:
-            self.logger.info(f"Handling group deletion for: {group_id}")
+            self.logger.debug(f"Handling group deletion for: {group_id}")
 
             # Call the data entities processor to handle the deletion logic
             success = await self.data_entities_processor.on_user_group_deleted(
@@ -2190,7 +2195,7 @@ class OneDriveConnector(BaseConnector):
             user_id: The user identifier
         """
         try:
-            self.logger.info(f"Starting sync for user {user_id}")
+            self.logger.debug(f"Starting sync for user {user_id}")
 
             # Get current sync state
             root_url = f"/users/{user_id}/drive/root/delta"
@@ -2236,7 +2241,7 @@ class OneDriveConnector(BaseConnector):
 
                         # Save the RecordGroup
                         await self.data_entities_processor.on_new_record_groups([(record_group, owner_permissions)])
-                        self.logger.info(f"Created RecordGroup for user {user_id} with drive ID {drive.id}")
+                        self.logger.debug(f"Created RecordGroup for user {user_id} with drive ID {drive.id}")
                     else:
                         self.logger.warning(f"Could not fetch user info for {user_id}, skipping RecordGroup creation")
                 except Exception as e:
@@ -2314,7 +2319,7 @@ class OneDriveConnector(BaseConnector):
                     except Exception as e:
                         self.logger.error(f"❌ Could not queue items of OneDrive {drive_id} to be read again: {e}")
 
-            self.logger.info(f"Completed delta sync for user {user_id}")
+            self.logger.debug(f"Completed delta sync for user {user_id}")
 
         except Exception as ex:
             self.logger.error(f"❌ Error in delta sync for user {user_id}: {ex}")
@@ -2432,6 +2437,7 @@ class OneDriveConnector(BaseConnector):
                         batch_count += 1
                         if batch_count >= self.batch_size:
                             await self.data_entities_processor.on_new_records(batch_records)
+                            self._tally["new"] += len(batch_records)
                             batch_records = []
                             batch_count = 0
                             # Allow other operations to proceed
@@ -2439,6 +2445,7 @@ class OneDriveConnector(BaseConnector):
 
                 if batch_records:
                     await self.data_entities_processor.on_new_records(batch_records)
+                    self._tally["new"] += len(batch_records)
                     batch_records = []
                     batch_count = 0
             except Exception as apply_error:
@@ -2629,7 +2636,7 @@ class OneDriveConnector(BaseConnector):
         await self.drive_delta_sync_point.update_sync_point(_drive_permissions_key(drive_id), update)
         permission_state.update(update)
         self._items_without_known_inheritance.pop(drive_id, None)
-        if update["mode"] == PERMISSION_MODE_INHERITANCE:
+        if update["mode"] == PERMISSION_MODE_INHERITANCE and stored.get("mode") != PERMISSION_MODE_INHERITANCE:
             self.logger.info(f"✅ OneDrive {drive_id}: items now inherit their folder's access")
 
     async def _save_items_without_known_inheritance(self, drive_id: str) -> None:
@@ -2829,7 +2836,7 @@ class OneDriveConnector(BaseConnector):
                     users_to_sync.append(user)
                     continue
                 failed_users.append((user.email, onedrive_status))
-                self.logger.info(
+                self.logger.debug(
                     "Skipping user %s: OneDrive status is %s",
                     user.email,
                     onedrive_status.value,
@@ -2866,8 +2873,15 @@ class OneDriveConnector(BaseConnector):
                         synced.append(user)
                 await asyncio.sleep(1)
 
-            self.logger.info("Completed processing all user batches")
+            self.logger.debug("Completed processing all user batches")
             await self._sync_shared_folders(synced, {u.source_user_id for u in users_to_sync})
+            skipped = Counter(status for _, status in failed_users)
+            self.logger.info(
+                f"Synced {len(synced)} of {len(users_to_sync)} OneDrives: {self._tally['new']} records saved, "
+                f"{self._tally['updated']} updated, {self._tally['removed']} removed; skipped "
+                f"{skipped[OneDriveUserStatus.NOT_PROVISIONED]} users without a OneDrive, "
+                f"{skipped[OneDriveUserStatus.LOCKED]} locked, {skipped[OneDriveUserStatus.UNKNOWN_ERROR]} unreadable"
+            )
 
         except Exception as e:
             self.logger.error(f"❌ Error processing users in batches: {e}")
@@ -2998,9 +3012,11 @@ class OneDriveConnector(BaseConnector):
                 batch.append((update.record, update.new_permissions or []))
             if len(batch) >= self.batch_size:
                 await self.data_entities_processor.on_new_records(batch)
+                self._tally["new"] += len(batch)
                 batch = []
         if batch:
             await self.data_entities_processor.on_new_records(batch)
+            self._tally["new"] += len(batch)
 
     async def _save_shared_drive_group(self, drive_id: str) -> None:
         """The record group of a OneDrive whose owner is not synced: no owner grant, only the folders'."""
@@ -3195,7 +3211,7 @@ class OneDriveConnector(BaseConnector):
             record_id: The ID of the record to reindex
         """
         try:
-            self.logger.info(f"Handling reindex event for record {record_id}")
+            self.logger.debug(f"Handling reindex event for record {record_id}")
 
             # Get the record from database
             record = await self.data_entities_processor.get_record_by_external_id(
@@ -3229,7 +3245,7 @@ class OneDriveConnector(BaseConnector):
                             record_update.new_permissions
                         )
 
-            self.logger.info(f"Completed reindex for record {record_id}")
+            self.logger.debug(f"Completed reindex for record {record_id}")
 
         except Exception as e:
             self.logger.error(f"❌ Error handling reindex event: {e}")
@@ -3242,7 +3258,7 @@ class OneDriveConnector(BaseConnector):
             notification: The webhook notification payload
         """
         try:
-            self.logger.info("Processing webhook notification")
+            self.logger.debug("Processing webhook notification")
 
             # Reinitialize credential if needed (webhooks might arrive after days of inactivity)
             await self._reinitialize_credential_if_needed()
@@ -3261,7 +3277,7 @@ class OneDriveConnector(BaseConnector):
                 # Run incremental sync for this user
                 await self._run_sync_with_yield(user_id)
 
-            self.logger.info("Webhook notification processed successfully")
+            self.logger.debug("Webhook notification processed successfully")
 
         except Exception as e:
             self.logger.error(f"❌ Error handling webhook notification: {e}")
@@ -3282,6 +3298,7 @@ class OneDriveConnector(BaseConnector):
             self._reset_permission_scopes()
             self._health = RunHealth()
             self._read_again = []
+            self._tally = Counter()
 
             self.sync_filters, self.indexing_filters = await load_connector_filters(
                 self.config_service, "onedrive", self.connector_id, self.logger
@@ -3289,15 +3306,15 @@ class OneDriveConnector(BaseConnector):
             await self._remind_about_certificate()
 
             # Step 1: Sync users
-            self.logger.info("Syncing users...")
+            self.logger.debug("Syncing users...")
             users = await self._sync_users()
 
             # Step 2: Sync user groups and their members
-            self.logger.info("Syncing user groups...")
+            self.logger.debug("Syncing user groups...")
             await self._sync_user_groups()
 
             # Step 3: Process user drives with yielding for non-blocking operation
-            self.logger.info("Syncing user drives...")
+            self.logger.debug("Syncing user drives...")
             await self._process_users_in_batches(users)
 
             await self._finish_run()
@@ -3404,6 +3421,7 @@ class OneDriveConnector(BaseConnector):
             await self._reinitialize_credential_if_needed()
             self._reset_permission_scopes()
             self._health = RunHealth()
+            self._tally = Counter()
             await self._remind_about_certificate()
 
             # Sync all active users
@@ -3424,7 +3442,7 @@ class OneDriveConnector(BaseConnector):
         Cleanup resources when shutting down the connector.
         """
         try:
-            self.logger.info("Cleaning up OneDrive connector resources")
+            self.logger.debug("Cleaning up OneDrive connector resources")
 
             # Clear caches
             # self.processed_items.clear()
@@ -3444,13 +3462,13 @@ class OneDriveConnector(BaseConnector):
             if hasattr(self, 'credential') and self.credential:
                 try:
                     await self.credential.close()
-                    self.logger.info("✅ Credential HTTP transport closed successfully")
+                    self.logger.debug("✅ Credential HTTP transport closed successfully")
                 except Exception as cred_error:
                     self.logger.warning(f"⚠️ Error closing credential (may already be closed): {cred_error}")
                 finally:
                     self.credential = None
 
-            self.logger.info("OneDrive connector cleanup completed")
+            self.logger.debug("OneDrive connector cleanup completed")
 
         except Exception as e:
             self.logger.error(f"❌ Error during cleanup: {e}")
@@ -3537,7 +3555,7 @@ class OneDriveConnector(BaseConnector):
 
             # Only return data if there's an actual update (metadata, content, or permissions)
             if record_update.is_updated:
-                self.logger.info(f"Record {item_id} has changed at source. Updating.")
+                self.logger.debug(f"Record {item_id} has changed at source. Updating.")
                 # Ensure we keep the internal DB ID
                 record_update.record.id = record.id
                 return (record_update.record, record_update.new_permissions, record_update.content_changed)
@@ -3786,7 +3804,7 @@ class OneDriveConnector(BaseConnector):
         for scope_name, probe in scope_probes:
             try:
                 await probe()
-                self.logger.info(f"✅ Permission verified: {scope_name}")
+                self.logger.debug(f"✅ Permission verified: {scope_name}")
             except ODataError as e:
                 error_code = (e.error.code or "") if e.error else ""
                 if error_code == "Authorization_RequestDenied" or e.response_status_code == 403:
@@ -3923,7 +3941,7 @@ class OneDriveSubscriptionManager:
 
             if result and result.id:
                 self.subscriptions[user_id] = result.id
-                self.logger.info(f"Created subscription {result.id} for user {user_id}")
+                self.logger.debug(f"Created subscription {result.id} for user {user_id}")
                 return result.id
 
             return None
@@ -3952,7 +3970,7 @@ class OneDriveSubscriptionManager:
             async with self.client.rate_limiter:
                 await self.client.client.subscriptions.by_subscription_id(subscription_id).patch(subscription_update)
 
-            self.logger.info(f"Renewed subscription {subscription_id}")
+            self.logger.debug(f"Renewed subscription {subscription_id}")
             return True
 
         except Exception as e:
@@ -3978,7 +3996,7 @@ class OneDriveSubscriptionManager:
             if user_id:
                 del self.subscriptions[user_id]
 
-            self.logger.info(f"Deleted subscription {subscription_id}")
+            self.logger.debug(f"Deleted subscription {subscription_id}")
             return True
 
         except Exception as e:
