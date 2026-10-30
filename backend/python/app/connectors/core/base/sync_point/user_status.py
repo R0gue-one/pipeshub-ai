@@ -1,9 +1,9 @@
-"""Which Workspace accounts can no longer sign in, and which just came back.
+"""Which directory accounts (Google Workspace, Microsoft Entra ID) can no longer sign in, and which just came back.
 
 One job: compare this run's complete user listing with the last one, kept in a sync point, and say whose access
 to take away (newly suspended, archived or deleted) and whose to rebuild (suspended or archived before, active
-now). A suspended, archived or deleted account cannot open anything in Google Drive, but its PipesHub account
-would keep every grant the connector ever wrote for it.
+now). A suspended, archived, disabled or deleted account cannot open anything at the source, but its PipesHub
+account would keep every grant the connector ever wrote for it. Used by the Google Drive and OneDrive connectors.
 
 The state is saved only by `save()`, which the caller calls after the access changes went through, so a run that
 fails part-way repeats them next time.
@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from app.connectors.core.base.sync_point.sync_point import SyncPoint
     from app.models.entities import AppUser
 
+# Kept from when only Google Drive used it: renaming would lose every connector's stored state.
 USER_STATUS_SYNC_POINT_KEY = "workspace_user_status"
 
 
@@ -39,7 +40,7 @@ class UserStatusTracker:
         self._pending: dict | None = None
 
     async def compare(self, listed: list[AppUser]) -> UserStatusChange:
-        """`listed` must be a complete listing of the Workspace's users."""
+        """`listed` must be a complete listing of the directory's users."""
         stored = await self._sync_point.read_sync_point(USER_STATUS_SYNC_POINT_KEY) or {}
         was_inactive = {e for e in stored.get("inactive") or [] if isinstance(e, str)}
         was_known = {e for e in stored.get("known") or [] if isinstance(e, str)}

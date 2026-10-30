@@ -62,7 +62,7 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
 
-from app.connectors.sources.google.drive.team.user_status import UserStatusChange
+from app.connectors.core.base.sync_point.user_status import UserStatusChange
 from app.config.constants.arangodb import (
     CollectionNames,
     Connectors,

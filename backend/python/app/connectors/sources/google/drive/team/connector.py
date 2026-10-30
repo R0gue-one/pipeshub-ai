@@ -121,7 +121,7 @@ from app.connectors.sources.google.common.impersonation import (
     is_delegation_error,
     resolve_explicit_user,
 )
-from app.connectors.sources.google.drive.team.user_status import UserStatusTracker
+from app.connectors.core.base.sync_point.user_status import UserStatusTracker
 from app.connectors.sources.google.drive.team.drive_access import (
     DrivePermissionBatch,
     grants_to_store,

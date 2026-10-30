@@ -29,7 +29,7 @@ from app.connectors.core.registry.filters import (
     IndexingFilterKey,
     SyncFilterKey,
 )
-from app.connectors.sources.google.drive.team.user_status import UserStatusChange
+from app.connectors.core.base.sync_point.user_status import UserStatusChange
 from app.connectors.sources.microsoft.common.msgraph_client import RecordUpdate
 from app.models.entities import (
     AppUser,

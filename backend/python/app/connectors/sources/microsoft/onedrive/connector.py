@@ -90,7 +90,7 @@ from app.connectors.sources.microsoft.onedrive.shortcuts import (
     ShortcutRegistry,
 )
 from app.connectors.sources.microsoft.sharepoint_online.drive_reconciler import DriveReconciler
-from app.connectors.sources.google.drive.team.user_status import UserStatusTracker
+from app.connectors.core.base.sync_point.user_status import UserStatusTracker
 from app.connectors.sources.microsoft.common.sharepoint_permission_scope import (
     ListUniquePermissions,
     SharePointAccessError,

@@ -20,7 +20,7 @@ from app.connectors.sources.google.common.access_problems import (
 from app.connectors.sources.google.common.connector_google_exceptions import (
     ServiceAccountKeyError,
 )
-from app.connectors.sources.google.drive.team.user_status import UserStatusTracker
+from app.connectors.core.base.sync_point.user_status import UserStatusTracker
 from app.connectors.sources.google.drive.utils.checkpoint_hold import (
     HELD_RUNS_FIELD,
     MAX_HELD_RUNS,

@@ -48,8 +48,9 @@ set -a; . integration-tests/connectors/sharepoint_sim.env; set +a
 cd integration-tests && pytest -m onedrive_sim connectors/onedrive
 ```
 
-## In CI (not wired yet)
+## In CI
 
-Once the simulator's OneDrive routes are on its `main` (`CONNSIM_SHAREPOINT_REF`), add `onedrive_sim` next to
-`sharepoint_sim` in `.github/workflows/integration-tests.yml`: the dispatch options, `NEEDS_SHAREPOINT_SIM`, and
-`CONN_SHARD_3`. Wiring it before then would fail the shard: the pinned simulator has no OneDrive routes.
+The suite runs on shard `connectors-3` (`CONN_SHARD_3` in `.github/workflows/integration-tests.yml`), next to
+`sharepoint_sim`, which starts the simulator and its TLS front for both. A manual run can pick `onedrive_sim` alone.
+`CONNSIM_SHAREPOINT_REF` pins connectors-simulator's `sim/onedrive` branch; move it to that repository's `main` once
+the OneDrive routes are merged there.

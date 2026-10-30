@@ -201,7 +201,7 @@ CONNECTOR_SHARDS = {
     "connectors-2": (
         "gitlab", "jira", "linear", "azure_blob", "azure_files", "smb", "zendesk", "outlook", "gmail_workspace", "gmail_individual",
     ),
-    "connectors-3": ("notion", "github_teams", "confluence", "s3", "gcs", "zammad", "sharepoint_sim"),
+    "connectors-3": ("notion", "github_teams", "confluence", "s3", "gcs", "zammad", "sharepoint_sim", "onedrive_sim"),
     "connectors-4": ("google_drive_workspace", "google_drive_individual"),
 }
 # The shards a pull request can run, in the workflow's order. Each one waits for
@@ -300,6 +300,7 @@ CONNECTOR_TESTS = "integration-tests/connectors"
 CONNECTOR_TEST_MARKERS: dict[str, tuple[str, ...]] = {
     "github_personal": ("github",),
     "gmail": ("gmail_workspace", "gmail_individual"),
+    "onedrive": ("onedrive_sim",),
     "sharepoint": ("sharepoint", "sharepoint_sim"),
     # Marked cifs, which no shard selects; core still collects the files.
     "cifs": (),
